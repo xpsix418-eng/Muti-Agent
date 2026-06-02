@@ -3,35 +3,45 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 import _bootstrap  # noqa: F401
 from algorithms.hungarian_assignment import HungarianAssignmentPolicy
+from algorithms.mappo.actor import MLPActor
+from algorithms.mappo.utils import RunningMeanStd
 from algorithms.rule_based import RuleBasedPolicy
 from envs.config import load_env_config
-from envs.counter_uav_env import CounterUAVEnv
+from envs.counter_uav_env import CounterUAVConfig, CounterUAVEnv
 from envs.scenarios import apply_scenario_to_config, initialize_scenario_state, scenario_metadata
 
 
-Policy = RuleBasedPolicy | HungarianAssignmentPolicy
+Policy = Any
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/env_2d.yaml")
-    parser.add_argument("--policy", choices=["rule_based", "hungarian"], default="rule_based")
+    parser.add_argument("--policy", choices=["rule_based", "hungarian", "mappo"], default="rule_based")
     parser.add_argument("--scenario", default="ScenarioB")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--experiment-name", default=None)
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--robustness_test", action="store_true")
     args = parser.parse_args()
 
     base_config = load_env_config(args.config)
-    env = CounterUAVEnv(apply_scenario_to_config(base_config, args.scenario))
-    policy = build_policy(args.policy)
+    scenario_config = apply_scenario_to_config(base_config, args.scenario)
+    if args.robustness_test:
+        run_robustness_test(args, scenario_config)
+        return
+    env = CounterUAVEnv(scenario_config)
+    policy = build_policy(args.policy, env, args.checkpoint)
     metadata = scenario_metadata(args.scenario)
     episode_rows = [
         evaluate_episode(env, policy, args.scenario, seed=args.seed + idx, metadata=metadata)
@@ -43,11 +53,36 @@ def main() -> None:
     print(json.dumps(metrics, indent=2))
 
 
-def build_policy(policy_name: str) -> Policy:
+class MAPPOCheckpointPolicy:
+    def __init__(self, checkpoint_path: str, env: CounterUAVEnv):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        obs_dim = env.observation_spaces[env.defense_agents[0]].shape[0]
+        action_dim = 2
+        hidden_dim = _infer_hidden_dim(checkpoint["actor"])
+        self.actor = MLPActor(obs_dim, action_dim, hidden_dim)
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.actor.eval()
+        self.obs_rms = RunningMeanStd((obs_dim,))
+        if "obs_rms" in checkpoint:
+            self.obs_rms.load_state_dict(checkpoint["obs_rms"])
+
+    def act(self, observations: dict[str, np.ndarray], agents: list[str]) -> np.ndarray:
+        obs = np.stack([observations[agent] for agent in agents]).astype(np.float32)
+        norm_obs = self.obs_rms.normalize(obs)
+        with torch.no_grad():
+            actions = self.actor.deterministic(torch.as_tensor(norm_obs, dtype=torch.float32)).cpu().numpy()
+        return np.clip(actions, -1.0, 1.0).astype(np.float32)
+
+
+def build_policy(policy_name: str, env: CounterUAVEnv, checkpoint_path: str | None = None) -> Policy:
+    if checkpoint_path:
+        return MAPPOCheckpointPolicy(checkpoint_path, env)
     if policy_name == "rule_based":
         return RuleBasedPolicy()
     if policy_name == "hungarian":
         return HungarianAssignmentPolicy()
+    if policy_name == "mappo":
+        raise ValueError("--policy mappo requires --checkpoint PATH")
     raise ValueError(f"Unsupported policy: {policy_name}")
 
 
@@ -59,7 +94,7 @@ def evaluate_episode(
     metadata: dict[str, float | int | str],
 ) -> dict[str, float]:
     rng = np.random.default_rng(seed)
-    _, info = env.reset(seed=seed)
+    observations, info = env.reset(seed=seed)
     initialize_scenario_state(env, scenario_name, rng)
     info = env._infos()
     initial_info = info[env.defense_agents[0]]
@@ -75,8 +110,8 @@ def evaluate_episode(
 
     for _ in range(env.config.max_steps):
         agent_info = info[env.defense_agents[0]]
-        actions = policy_action(env, policy, agent_info)
-        _, _, terminations, truncations, info = env.step(actions)
+        actions = policy_action(env, policy, agent_info, observations)
+        observations, _, terminations, truncations, info = env.step(actions)
         agent_info = info[env.defense_agents[0]]
         intercepted = np.asarray(agent_info["intercepted"], dtype=bool)
         breached = np.asarray(agent_info["breached"], dtype=bool)
@@ -112,7 +147,9 @@ def evaluate_episode(
     }
 
 
-def policy_action(env: CounterUAVEnv, policy: Policy, info: dict[str, Any]) -> np.ndarray:
+def policy_action(env: CounterUAVEnv, policy: Policy, info: dict[str, Any], observations: dict[str, np.ndarray]) -> np.ndarray:
+    if isinstance(policy, MAPPOCheckpointPolicy):
+        return policy.act(observations, env.defense_agents)
     common = {
         "defender_positions": info["defender_positions"],
         "defender_velocities": info["defender_velocities"],
@@ -178,6 +215,89 @@ def save_evaluation_results(
         writer.writeheader()
         for idx, row in enumerate(episode_rows):
             writer.writerow({"episode": idx, **row})
+
+
+def run_robustness_test(args: argparse.Namespace, scenario_config: CounterUAVConfig) -> None:
+    if not args.checkpoint:
+        raise ValueError("--robustness_test requires --checkpoint PATH")
+    rows = []
+    for condition_name, config in robustness_conditions(scenario_config).items():
+        env = CounterUAVEnv(config)
+        policy = build_policy("mappo", env, args.checkpoint)
+        metadata = scenario_metadata(args.scenario)
+        metadata = {
+            **metadata,
+            "packet_loss": config.packet_loss_prob,
+            "communication_delay": config.comm_delay_steps,
+            "observation_noise": config.noisy_observation_std,
+        }
+        episode_rows = [
+            evaluate_episode(env, policy, args.scenario, seed=args.seed + idx, metadata=metadata)
+            for idx in range(args.episodes)
+        ]
+        metrics = summarize_metrics(episode_rows, env, metadata)
+        rows.append({"condition": condition_name, **metrics})
+    experiment_name = args.experiment_name or f"robustness_{args.scenario}"
+    save_robustness_results(experiment_name, rows)
+    summary = {
+        "robustness_score": float(np.mean([row["robustness_score"] for row in rows])),
+        "conditions": rows,
+    }
+    print(json.dumps(summary, indent=2))
+
+
+def robustness_conditions(base: CounterUAVConfig) -> dict[str, CounterUAVConfig]:
+    return {
+        "no_comm_limit": replace(
+            base,
+            comm_radius=base.world_size * 2.0,
+            packet_loss_prob=0.0,
+            comm_delay_steps=0,
+            agent_dropout_prob=0.0,
+            noisy_observation_std=0.0,
+            partial_observation=False,
+        ),
+        "limited_comm_radius": replace(base, comm_radius=min(base.comm_radius, 120.0), partial_observation=True),
+        "packet_loss_10": replace(base, packet_loss_prob=0.10, partial_observation=True),
+        "packet_loss_30": replace(base, packet_loss_prob=0.30, partial_observation=True),
+        "delay_2_steps": replace(base, comm_delay_steps=2, partial_observation=True),
+        "agent_dropout_20": replace(base, agent_dropout_prob=0.20, partial_observation=True),
+        "noisy_observation": replace(base, noisy_observation_std=5.0, partial_observation=True),
+        "combined_disturbance": replace(
+            base,
+            comm_radius=min(base.comm_radius, 120.0),
+            packet_loss_prob=0.30,
+            comm_delay_steps=2,
+            agent_dropout_prob=0.20,
+            noisy_observation_std=5.0,
+            partial_observation=True,
+        ),
+    }
+
+
+def save_robustness_results(experiment_name: str, rows: list[dict[str, float | str]]) -> None:
+    output_dir = Path("experiments") / "results" / experiment_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "robustness_comparison.csv").open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    with (output_dir / "metrics.json").open("w", encoding="utf-8") as file:
+        json.dump(
+            {
+                "robustness_score": float(np.mean([float(row["robustness_score"]) for row in rows])),
+                "conditions": rows,
+            },
+            file,
+            indent=2,
+        )
+
+
+def _infer_hidden_dim(actor_state: dict[str, torch.Tensor]) -> int:
+    first_weight = actor_state.get("net.0.weight")
+    if first_weight is None:
+        return 128
+    return int(first_weight.shape[0])
 
 
 if __name__ == "__main__":

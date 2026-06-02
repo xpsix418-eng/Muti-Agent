@@ -13,7 +13,14 @@ env:
   dt: 1.0
   nearest_intruders: 4
   nearest_teammates: 3
-  communication_radius: 250.0
+  comm_radius: 250.0
+  packet_loss_prob: 0.0
+  comm_delay_steps: 0
+  agent_dropout_prob: 0.0
+  agent_dropout_duration_steps: 2
+  noisy_observation_std: 0.0
+  partial_observation: false
+  observation_radius: 450.0
   collision_radius: 5.0
   defender_acceleration_scale: 4.0
   intruder_behavior: straight_attack

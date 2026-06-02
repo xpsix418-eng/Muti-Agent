@@ -31,7 +31,7 @@ class CounterUAVConfig:
     dt: float
     nearest_intruders: int
     nearest_teammates: int
-    communication_radius: float
+    comm_radius: float
     collision_radius: float
     defender_acceleration_scale: float
     initial_energy: float
@@ -42,6 +42,17 @@ class CounterUAVConfig:
     step_penalty: float
     threat_reward_scale: float
     intruder_behavior: str = "straight_attack"
+    packet_loss_prob: float = 0.0
+    comm_delay_steps: int = 0
+    agent_dropout_prob: float = 0.0
+    agent_dropout_duration_steps: int = 2
+    noisy_observation_std: float = 0.0
+    partial_observation: bool = False
+    observation_radius: float = 450.0
+
+    @property
+    def communication_radius(self) -> float:
+        return self.comm_radius
 
 
 class CounterUAVEnv(gym.Env):
@@ -70,6 +81,9 @@ class CounterUAVEnv(gym.Env):
         self.intercepted = np.zeros(self.config.num_intruders, dtype=bool)
         self.breached = np.zeros(self.config.num_intruders, dtype=bool)
         self.collision_events: list[tuple[str, str]] = []
+        self.comm_adj = np.zeros((self.config.num_defenders, self.config.num_defenders), dtype=np.float32)
+        self.dropout_remaining = np.zeros(self.config.num_defenders, dtype=np.int32)
+        self.observation_history: list[dict[str, Array]] = []
         self.threat_model = ThreatModel(
             world_size=self.config.world_size,
             protected_radius=self.config.protected_radius,
@@ -109,6 +123,10 @@ class CounterUAVEnv(gym.Env):
         self.intercepted.fill(False)
         self.breached.fill(False)
         self.collision_events = []
+        self.dropout_remaining.fill(0)
+        self.observation_history = []
+        self._append_observation_snapshot()
+        self._update_communication_state()
         return self._observations(), self._infos()
 
     def step(
@@ -123,6 +141,8 @@ class CounterUAVEnv(gym.Env):
         collisions = self._detect_collisions()
         self.collision_events = collisions
         self.step_count += 1
+        self._update_communication_state()
+        self._append_observation_snapshot()
 
         all_done = bool(np.all(~self.intruder_active) or np.any(self.breached))
         truncated = self.step_count >= self.config.max_steps
@@ -258,24 +278,40 @@ class CounterUAVEnv(gym.Env):
         own_pos = self.defender_positions[defender_idx]
         own_vel = self.defender_velocities[defender_idx]
         own_energy = np.asarray([self.defender_energy[defender_idx]], dtype=np.float32)
+        observed_intruder_positions = self._noisy_values(self.intruder_positions)
+        observed_intruder_velocities = self._noisy_values(self.intruder_velocities)
 
-        intruder_idx = self._nearest_indices(self.intruder_positions, own_pos, self.config.nearest_intruders)
-        intruder_rel_pos = self._relative_block(self.intruder_positions, own_pos, intruder_idx, self.config.nearest_intruders)
+        intruder_idx = self._nearest_indices(
+            observed_intruder_positions,
+            own_pos,
+            self.config.nearest_intruders,
+            active_mask=self._observable_intruder_mask(defender_idx, observed_intruder_positions),
+        )
+        intruder_rel_pos = self._relative_block(observed_intruder_positions, own_pos, intruder_idx, self.config.nearest_intruders)
         intruder_rel_vel = self._relative_block(
-            self.intruder_velocities, own_vel, intruder_idx, self.config.nearest_intruders
+            observed_intruder_velocities, own_vel, intruder_idx, self.config.nearest_intruders
         )
         threat_scores = self._threat_scores()
         intruder_threat = self._scalar_block(threat_scores, intruder_idx, self.config.nearest_intruders)
 
-        teammate_positions = np.delete(self.defender_positions, defender_idx, axis=0)
-        teammate_velocities = np.delete(self.defender_velocities, defender_idx, axis=0)
-        teammate_idx = self._nearest_indices(teammate_positions, own_pos, self.config.nearest_teammates)
+        delayed = self._delayed_observation_snapshot()
+        teammate_positions_all = self._noisy_values(delayed["defender_positions"])
+        teammate_velocities_all = self._noisy_values(delayed["defender_velocities"])
+        teammate_positions = np.delete(teammate_positions_all, defender_idx, axis=0)
+        teammate_velocities = np.delete(teammate_velocities_all, defender_idx, axis=0)
+        teammate_mask = np.delete(self.comm_adj[defender_idx] > 0.0, defender_idx)
+        teammate_idx = self._nearest_indices(
+            teammate_positions,
+            own_pos,
+            self.config.nearest_teammates,
+            active_mask=teammate_mask,
+        )
         teammate_rel_pos = self._relative_block(teammate_positions, own_pos, teammate_idx, self.config.nearest_teammates)
         teammate_rel_vel = self._relative_block(
             teammate_velocities, own_vel, teammate_idx, self.config.nearest_teammates
         )
 
-        communication_available = np.asarray([float(np.any(self._communication_topology()[defender_idx]))], dtype=np.float32)
+        communication_available = np.asarray([float(np.any(self.comm_adj[defender_idx]))], dtype=np.float32)
         asset_rel_pos = self.protected_asset - own_pos
         observation = np.concatenate(
             [
@@ -309,6 +345,16 @@ class CounterUAVEnv(gym.Env):
             "breached": self.breached.copy(),
             "collision_events": list(self.collision_events),
             "communication_topology": self._communication_topology(),
+            "comm_adj": self.comm_adj.copy(),
+            "dropout_remaining": self.dropout_remaining.copy(),
+            "communication_params": {
+                "comm_radius": self.config.comm_radius,
+                "packet_loss_prob": self.config.packet_loss_prob,
+                "comm_delay_steps": self.config.comm_delay_steps,
+                "agent_dropout_prob": self.config.agent_dropout_prob,
+                "noisy_observation_std": self.config.noisy_observation_std,
+                "partial_observation": self.config.partial_observation,
+            },
         }
         return {agent: dict(global_info) for agent in self.defense_agents}
 
@@ -327,12 +373,58 @@ class CounterUAVEnv(gym.Env):
         )
 
     def _communication_topology(self) -> Array:
+        return self.comm_adj.copy()
+
+    def _update_communication_state(self) -> None:
+        self.dropout_remaining = np.maximum(self.dropout_remaining - 1, 0)
+        new_dropouts = self.rng.random(self.config.num_defenders) < self.config.agent_dropout_prob
+        self.dropout_remaining[new_dropouts] = self.config.agent_dropout_duration_steps
         distances = np.linalg.norm(
             self.defender_positions[:, None, :] - self.defender_positions[None, :, :], axis=-1
         )
-        topology = (distances <= self.config.communication_radius).astype(np.float32)
+        topology = (distances <= self.config.comm_radius).astype(np.float32)
         np.fill_diagonal(topology, 0.0)
-        return topology
+        if self.config.packet_loss_prob > 0.0:
+            keep = (self.rng.random(topology.shape) >= self.config.packet_loss_prob).astype(np.float32)
+            keep = np.triu(keep, k=1)
+            keep = keep + keep.T
+            topology *= keep
+        dropped = self.dropout_remaining > 0
+        topology[dropped, :] = 0.0
+        topology[:, dropped] = 0.0
+        self.comm_adj = topology.astype(np.float32)
+
+    def _append_observation_snapshot(self) -> None:
+        self.observation_history.append(
+            {
+                "defender_positions": self.defender_positions.copy(),
+                "defender_velocities": self.defender_velocities.copy(),
+                "intruder_positions": self.intruder_positions.copy(),
+                "intruder_velocities": self.intruder_velocities.copy(),
+            }
+        )
+        max_len = max(self.config.comm_delay_steps + 2, 2)
+        if len(self.observation_history) > max_len:
+            self.observation_history = self.observation_history[-max_len:]
+
+    def _delayed_observation_snapshot(self) -> dict[str, Array]:
+        if not self.observation_history:
+            self._append_observation_snapshot()
+        index = max(0, len(self.observation_history) - 1 - self.config.comm_delay_steps)
+        return self.observation_history[index]
+
+    def _noisy_values(self, values: Array) -> Array:
+        if self.config.noisy_observation_std <= 0.0:
+            return values.copy()
+        noise = self.rng.normal(0.0, self.config.noisy_observation_std, size=values.shape)
+        return (values + noise).astype(np.float32)
+
+    def _observable_intruder_mask(self, defender_idx: int, intruder_positions: Array) -> Array:
+        active = self.intruder_active.copy()
+        if not self.config.partial_observation:
+            return active
+        distances = np.linalg.norm(intruder_positions - self.defender_positions[defender_idx][None, :], axis=1)
+        return active & (distances <= self.config.observation_radius)
 
     def _spawn_defenders(self) -> Array:
         radius = self.config.protected_radius * 0.5
@@ -358,11 +450,17 @@ class CounterUAVEnv(gym.Env):
             return np.clip(action_array, -1.0, 1.0)
         return np.clip(np.asarray(actions, dtype=np.float32).reshape(self.config.num_defenders, 2), -1.0, 1.0)
 
-    def _nearest_indices(self, positions: Array, center: Array, count: int) -> Array:
+    def _nearest_indices(self, positions: Array, center: Array, count: int, active_mask: Array | None = None) -> Array:
         if len(positions) == 0 or count <= 0:
             return np.asarray([], dtype=np.int64)
         distances = np.linalg.norm(positions - center[None, :], axis=1)
-        return np.argsort(distances)[: min(count, len(positions))]
+        if active_mask is not None:
+            distances = np.where(active_mask, distances, np.inf)
+        if not np.any(np.isfinite(distances)):
+            return np.asarray([], dtype=np.int64)
+        ordered = np.argsort(distances)
+        ordered = ordered[np.isfinite(distances[ordered])]
+        return ordered[: min(count, len(ordered))]
 
     def _relative_block(self, values: Array, reference: Array, indices: Array, count: int) -> Array:
         block = np.zeros((count, 2), dtype=np.float32)
@@ -455,7 +553,7 @@ def config_from_mapping(env_data: dict[str, Any]) -> CounterUAVConfig:
         dt=float(env_data["dt"]),
         nearest_intruders=int(env_data.get("nearest_intruders", 4)),
         nearest_teammates=int(env_data.get("nearest_teammates", 3)),
-        communication_radius=float(env_data.get("communication_radius", 250.0)),
+        comm_radius=float(env_data.get("comm_radius", env_data.get("communication_radius", 250.0))),
         collision_radius=float(env_data.get("collision_radius", 5.0)),
         defender_acceleration_scale=float(env_data.get("defender_acceleration_scale", 4.0)),
         initial_energy=float(env_data.get("initial_energy", 100.0)),
@@ -466,6 +564,13 @@ def config_from_mapping(env_data: dict[str, Any]) -> CounterUAVConfig:
         step_penalty=float(env_data.get("reward", {}).get("step", -0.01)),
         threat_reward_scale=float(env_data.get("reward", {}).get("threat_scale", 0.1)),
         intruder_behavior=str(env_data.get("intruder_behavior", "straight_attack")),
+        packet_loss_prob=float(env_data.get("packet_loss_prob", 0.0)),
+        comm_delay_steps=int(env_data.get("comm_delay_steps", 0)),
+        agent_dropout_prob=float(env_data.get("agent_dropout_prob", 0.0)),
+        agent_dropout_duration_steps=int(env_data.get("agent_dropout_duration_steps", 2)),
+        noisy_observation_std=float(env_data.get("noisy_observation_std", 0.0)),
+        partial_observation=bool(env_data.get("partial_observation", False)),
+        observation_radius=float(env_data.get("observation_radius", 450.0)),
     )
 
 

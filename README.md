@@ -61,6 +61,7 @@ Evaluate a random or rule-based policy:
 ```bash
 python scripts/evaluate.py --config configs/env_2d.yaml --policy rule_based --scenario ScenarioB
 python scripts/evaluate.py --config configs/env_2d.yaml --policy hungarian --scenario ScenarioE
+python scripts/evaluate.py --checkpoint experiments/results/mappo/ScenarioA/checkpoints/latest.pt --scenario ScenarioE --robustness_test
 ```
 
 Visualize a simulated rollout:
@@ -79,6 +80,7 @@ This repository is for algorithmic research inside isolated 2D/3D simulation onl
 - Code intended to guide real-world harm or physical engagement.
 
 All examples use abstract point-mass agents, synthetic goals, synthetic threats, and purely simulated state transitions.
+Communication and observation limits are simulated as abstract graph/dropout/noise processes only; they do not model or implement real communication protocols, real electromagnetic effects, or practical interference mechanisms.
 
 ## Layout
 

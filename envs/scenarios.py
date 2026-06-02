@@ -29,7 +29,7 @@ class ScenarioSpec:
     description: str
     num_defenders: int
     num_intruders: int
-    communication_radius: float | None = None
+    comm_radius: float | None = None
     intruder_behavior: str | None = None
     packet_loss: float = 0.0
     communication_delay: int = 0
@@ -55,7 +55,7 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         "Communication-limited scenario",
         8,
         16,
-        communication_radius=120.0,
+        comm_radius=120.0,
         packet_loss=0.35,
         communication_delay=2,
         observation_noise=3.0,
@@ -84,8 +84,15 @@ def apply_scenario_to_config(config: CounterUAVConfig, scenario_name: str) -> Co
         "num_defenders": scenario.num_defenders,
         "num_intruders": scenario.num_intruders,
     }
-    if scenario.communication_radius is not None:
-        updates["communication_radius"] = scenario.communication_radius
+    if scenario.comm_radius is not None:
+        updates["comm_radius"] = scenario.comm_radius
+    if scenario.packet_loss > 0.0:
+        updates["packet_loss_prob"] = scenario.packet_loss
+    if scenario.communication_delay > 0:
+        updates["comm_delay_steps"] = scenario.communication_delay
+    if scenario.observation_noise > 0.0:
+        updates["noisy_observation_std"] = scenario.observation_noise
+        updates["partial_observation"] = True
     if scenario.intruder_behavior is not None:
         updates["intruder_behavior"] = scenario.intruder_behavior
     return replace(config, **updates)
@@ -110,6 +117,7 @@ def scenario_metadata(scenario_name: str) -> dict[str, float | int | str]:
         "packet_loss": scenario.packet_loss,
         "communication_delay": scenario.communication_delay,
         "observation_noise": scenario.observation_noise,
+        "comm_radius": scenario.comm_radius if scenario.comm_radius is not None else -1.0,
         "num_defenders": scenario.num_defenders,
         "num_intruders": scenario.num_intruders,
     }

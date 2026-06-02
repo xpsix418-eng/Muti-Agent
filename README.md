@@ -52,7 +52,8 @@ python scripts/train_rule_based.py --config configs/env_2d.yaml --policy hungari
 MAPPO scaffold:
 
 ```bash
-python scripts/train_mappo.py --config configs/train_mappo.yaml
+python scripts/train_mappo.py --config configs/train_mappo.yaml --scenario ScenarioA
+python scripts/train_mappo.py --config configs/train_mappo.yaml --scenario ScenarioB
 ```
 
 Evaluate a random or rule-based policy:

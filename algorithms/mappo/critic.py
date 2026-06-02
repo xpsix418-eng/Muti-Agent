@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 
-class CentralizedCritic(nn.Module):
+class MLPCritic(nn.Module):
     def __init__(self, state_dim: int, hidden_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
@@ -15,5 +15,8 @@ class CentralizedCritic(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.net(state).squeeze(-1)
+    def forward(self, global_state: torch.Tensor) -> torch.Tensor:
+        return self.net(global_state).squeeze(-1)
+
+
+CentralizedCritic = MLPCritic

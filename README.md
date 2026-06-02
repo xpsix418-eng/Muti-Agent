@@ -45,7 +45,8 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 Rule-based rollout:
 
 ```bash
-python scripts/train_rule_based.py --config configs/env_2d.yaml
+python scripts/train_rule_based.py --config configs/env_2d.yaml --policy rule_based
+python scripts/train_rule_based.py --config configs/env_2d.yaml --policy hungarian
 ```
 
 MAPPO scaffold:

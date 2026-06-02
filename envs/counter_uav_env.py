@@ -304,6 +304,7 @@ class CounterUAVEnv(gym.Env):
             "defender_velocities": self.defender_velocities.copy(),
             "intruder_positions": self.intruder_positions.copy(),
             "intruder_velocities": self.intruder_velocities.copy(),
+            "threat_scores": self._threat_scores(),
             "intercepted": self.intercepted.copy(),
             "breached": self.breached.copy(),
             "collision_events": list(self.collision_events),

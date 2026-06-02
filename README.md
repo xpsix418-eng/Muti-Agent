@@ -58,13 +58,14 @@ python scripts/train_mappo.py --config configs/train_mappo.yaml
 Evaluate a random or rule-based policy:
 
 ```bash
-python scripts/evaluate.py --config configs/env_2d.yaml
+python scripts/evaluate.py --config configs/env_2d.yaml --policy rule_based --scenario ScenarioB
+python scripts/evaluate.py --config configs/env_2d.yaml --policy hungarian --scenario ScenarioE
 ```
 
 Visualize a simulated rollout:
 
 ```bash
-python scripts/visualize_rollout.py --config configs/env_2d.yaml
+python scripts/visualize_rollout.py --config configs/env_2d.yaml --policy rule_based --scenario ScenarioB
 ```
 
 ## Safety Boundary

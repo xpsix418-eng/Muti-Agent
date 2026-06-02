@@ -45,6 +45,113 @@ class RewardEvents:
     communication_links: int
 
 
+def predict_intercept_points(
+    intruder_positions: Array,
+    intruder_velocities: Array,
+    prediction_horizon: float,
+    world_size: float | None = None,
+) -> Array:
+    """Predict future points on synthetic intruder trajectories."""
+    points = np.asarray(intruder_positions, dtype=np.float32) + np.asarray(intruder_velocities, dtype=np.float32) * float(
+        prediction_horizon
+    )
+    if world_size is not None:
+        points = np.clip(points, 0.0, float(world_size))
+    return points.astype(np.float32)
+
+
+def intercept_point_approach_reward(
+    previous_defender_positions: Array,
+    current_defender_positions: Array,
+    previous_intercept_points: Array,
+    current_intercept_points: Array,
+    assigned_targets: Array,
+) -> Array:
+    assigned_targets = np.asarray(assigned_targets, dtype=np.int64)
+    rewards = np.zeros(len(assigned_targets), dtype=np.float32)
+    valid = assigned_targets >= 0
+    if not np.any(valid):
+        return rewards
+    defender_indices = np.where(valid)[0]
+    target_indices = assigned_targets[valid]
+    previous_distances = np.linalg.norm(
+        previous_defender_positions[defender_indices] - previous_intercept_points[target_indices],
+        axis=1,
+    )
+    current_distances = np.linalg.norm(
+        current_defender_positions[defender_indices] - current_intercept_points[target_indices],
+        axis=1,
+    )
+    rewards[defender_indices] = (previous_distances - current_distances).astype(np.float32)
+    return rewards
+
+
+def blocking_position_reward(
+    defender_positions: Array,
+    intruder_positions: Array,
+    protected_asset_position: Array,
+    assigned_targets: Array,
+    blocking_sigma: float,
+) -> Array:
+    assigned_targets = np.asarray(assigned_targets, dtype=np.int64)
+    rewards = np.zeros(len(assigned_targets), dtype=np.float32)
+    sigma = max(float(blocking_sigma), 1e-6)
+    for defender_idx, target_idx in enumerate(assigned_targets.tolist()):
+        if target_idx < 0:
+            continue
+        intruder_pos = intruder_positions[target_idx]
+        attack_vector = protected_asset_position - intruder_pos
+        attack_length = float(np.linalg.norm(attack_vector))
+        if attack_length <= 1e-6:
+            continue
+        defender_vector = defender_positions[defender_idx] - intruder_pos
+        projection = float(np.dot(defender_vector, attack_vector) / attack_length)
+        if projection <= 0.0 or projection >= attack_length:
+            continue
+        cross = attack_vector[0] * defender_vector[1] - attack_vector[1] * defender_vector[0]
+        perpendicular = float(abs(cross) / attack_length)
+        rewards[defender_idx] = float(np.exp(-perpendicular / sigma))
+    return rewards
+
+
+def ttc_advantage_reward(
+    defender_positions: Array,
+    intruder_positions: Array,
+    intruder_velocities: Array,
+    protected_asset_position: Array,
+    intercept_points: Array,
+    assigned_targets: Array,
+    defender_max_speed: float,
+) -> Array:
+    assigned_targets = np.asarray(assigned_targets, dtype=np.int64)
+    rewards = np.zeros(len(assigned_targets), dtype=np.float32)
+    defender_speed = max(float(defender_max_speed), 1e-6)
+    for defender_idx, target_idx in enumerate(assigned_targets.tolist()):
+        if target_idx < 0:
+            continue
+        intruder_speed = max(float(np.linalg.norm(intruder_velocities[target_idx])), 1e-6)
+        time_to_asset = np.linalg.norm(intruder_positions[target_idx] - protected_asset_position) / intruder_speed
+        time_to_intercept = np.linalg.norm(defender_positions[defender_idx] - intercept_points[target_idx]) / defender_speed
+        if time_to_intercept < time_to_asset:
+            rewards[defender_idx] = float((time_to_asset - time_to_intercept) / max(time_to_asset, 1e-6))
+    return rewards
+
+
+def intruder_progress_penalty(
+    previous_intruder_positions: Array,
+    current_intruder_positions: Array,
+    protected_asset_position: Array,
+    active_mask: Array,
+) -> float:
+    active = np.asarray(active_mask, dtype=bool)
+    if not np.any(active):
+        return 0.0
+    previous_distances = np.linalg.norm(previous_intruder_positions[active] - protected_asset_position[None, :], axis=1)
+    current_distances = np.linalg.norm(current_intruder_positions[active] - protected_asset_position[None, :], axis=1)
+    progress = np.maximum(previous_distances - current_distances, 0.0)
+    return float(np.mean(progress))
+
+
 def compute_reward(
     actions: Array,
     threat_scores: Array,

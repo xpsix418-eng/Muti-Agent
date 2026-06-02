@@ -3,11 +3,16 @@ import numpy as np
 from envs.reward import (
     RewardConfig,
     RewardEvents,
+    blocking_position_reward,
     compute_reward,
     detect_breaches,
     detect_defender_collisions,
     detect_intercepts,
+    intercept_point_approach_reward,
+    intruder_progress_penalty,
+    predict_intercept_points,
     team_reward,
+    ttc_advantage_reward,
 )
 from envs.threat_model import ThreatAssessment
 
@@ -59,3 +64,33 @@ def test_intercept_breach_and_collision_events_trigger() -> None:
     assert nearest.tolist() == [0, 1]
     assert breached.tolist() == [True, False]
     assert collisions == [(0, 1)]
+
+
+def test_intercept_point_reward_terms_are_finite_and_directional() -> None:
+    previous_defenders = np.array([[0.0, 0.0]], dtype=np.float32)
+    current_defenders = np.array([[2.0, 0.0]], dtype=np.float32)
+    intruders = np.array([[10.0, 0.0]], dtype=np.float32)
+    velocities = np.array([[1.0, 0.0]], dtype=np.float32)
+    asset = np.array([20.0, 0.0], dtype=np.float32)
+    assignments = np.array([0], dtype=np.int64)
+    intercept_points = predict_intercept_points(intruders, velocities, prediction_horizon=2.0)
+    approach = intercept_point_approach_reward(
+        previous_defenders,
+        current_defenders,
+        intercept_points,
+        intercept_points,
+        assignments,
+    )
+    blocking = blocking_position_reward(current_defenders, intruders, asset, assignments, blocking_sigma=10.0)
+    ttc = ttc_advantage_reward(current_defenders, intruders, velocities, asset, intercept_points, assignments, defender_max_speed=12.0)
+    progress_penalty = intruder_progress_penalty(
+        previous_intruder_positions=np.array([[8.0, 0.0]], dtype=np.float32),
+        current_intruder_positions=intruders,
+        protected_asset_position=asset,
+        active_mask=np.array([True]),
+    )
+    assert intercept_points.tolist() == [[12.0, 0.0]]
+    assert approach[0] > 0.0
+    assert np.isfinite(blocking[0])
+    assert ttc[0] > 0.0
+    assert progress_penalty > 0.0

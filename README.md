@@ -56,6 +56,12 @@ python scripts/train_mappo.py --config configs/train_mappo.yaml --scenario Scena
 python scripts/train_mappo.py --config configs/train_mappo.yaml --scenario ScenarioB
 ```
 
+A3 intercept-point reward curriculum:
+
+```bash
+python scripts/train_mappo.py --config configs/train_mappo_a3_intercept_point.yaml
+```
+
 Evaluate a random or rule-based policy:
 
 ```bash

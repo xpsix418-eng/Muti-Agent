@@ -10,7 +10,16 @@ import yaml
 from gymnasium import spaces
 
 from envs.dynamics import DynamicsConfig, update_defender_dynamics, update_intruder_dynamics
-from envs.reward import detect_breaches, detect_defender_collisions, detect_intercepts
+from envs.reward import (
+    blocking_position_reward,
+    detect_breaches,
+    detect_defender_collisions,
+    detect_intercepts,
+    intercept_point_approach_reward,
+    intruder_progress_penalty,
+    predict_intercept_points,
+    ttc_advantage_reward,
+)
 from envs.threat_model import ThreatModel
 
 
@@ -47,6 +56,15 @@ class CounterUAVConfig:
     collision_proximity_penalty: float = 0.0
     action_smoothness_penalty: float = 0.0
     action_magnitude_penalty: float = 0.01
+    approach_reward_scale: float = 0.0
+    intercept_point_approach_scale: float = 0.0
+    blocking_position_scale: float = 0.0
+    ttc_advantage_scale: float = 0.0
+    intruder_progress_penalty_scale: float = 0.0
+    collision_avoidance_penalty: float = 0.0
+    duplicate_assignment_penalty: float = 0.0
+    prediction_horizon: float = 8.0
+    blocking_sigma: float = 40.0
     separation_radius: float = 20.0
     intruder_behavior: str = "straight_attack"
 
@@ -78,6 +96,8 @@ class CounterUAVEnv(gym.Env):
         self.breached = np.zeros(self.config.num_intruders, dtype=bool)
         self.collision_events: list[tuple[str, str]] = []
         self.previous_actions = np.zeros((self.config.num_defenders, 2), dtype=np.float32)
+        self.previous_defender_positions = self.defender_positions.copy()
+        self.previous_intruder_positions = self.intruder_positions.copy()
         self._render_fig: Any | None = None
         self._render_ax: Any | None = None
         self.threat_model = ThreatModel(
@@ -120,16 +140,24 @@ class CounterUAVEnv(gym.Env):
         self.breached.fill(False)
         self.collision_events = []
         self.previous_actions.fill(0.0)
+        self.previous_defender_positions = self.defender_positions.copy()
+        self.previous_intruder_positions = self.intruder_positions.copy()
         return self._observations(), self._infos()
 
     def step(
         self, actions: dict[str, Array] | Array
     ) -> tuple[dict[str, Array], dict[str, float], dict[str, bool], dict[str, bool], dict[str, dict[str, Any]]]:
         action_array = self._normalize_actions(actions)
+        previous_defender_positions = self.defender_positions.copy()
+        previous_intruder_positions = self.intruder_positions.copy()
+        previous_intruder_velocities = self.intruder_velocities.copy()
         self._update_defenders(action_array)
         self._update_intruders()
 
         threat_scores_before_events = self._threat_scores()
+        assigned_targets = self._assigned_targets(threat_scores_before_events)
+        previous_intercept_points = self._predicted_intercept_points(previous_intruder_positions, previous_intruder_velocities)
+        current_intercept_points = self._predicted_intercept_points()
         intercepted_now = self._detect_intercepts()
         breached_now = self._detect_breaches()
         collisions = self._detect_collisions()
@@ -138,8 +166,21 @@ class CounterUAVEnv(gym.Env):
 
         all_done = bool(np.all(~self.intruder_active) or np.any(self.breached))
         truncated = self.step_count >= self.config.max_steps
-        rewards = self._rewards(action_array, intercepted_now, breached_now, collisions, threat_scores_before_events)
+        rewards = self._rewards(
+            action_array,
+            intercepted_now,
+            breached_now,
+            collisions,
+            threat_scores_before_events,
+            assigned_targets,
+            previous_defender_positions,
+            previous_intruder_positions,
+            previous_intercept_points,
+            current_intercept_points,
+        )
         self.previous_actions = action_array.copy()
+        self.previous_defender_positions = previous_defender_positions
+        self.previous_intruder_positions = previous_intruder_positions
         terminations = {agent: all_done for agent in self.defense_agents}
         terminations["__all__"] = all_done
         truncations = {agent: truncated for agent in self.defense_agents}
@@ -254,6 +295,11 @@ class CounterUAVEnv(gym.Env):
         breached_now: Array,
         collisions: list[tuple[str, str]],
         threat_scores_before_events: Array,
+        assigned_targets: Array,
+        previous_defender_positions: Array,
+        previous_intruder_positions: Array,
+        previous_intercept_points: Array,
+        current_intercept_points: Array,
     ) -> dict[str, float]:
         active_after_events = self.intruder_active.copy()
         dense_intercept_reward = self._dense_intercept_reward(threat_scores_before_events, active_after_events)
@@ -261,14 +307,62 @@ class CounterUAVEnv(gym.Env):
         proximity_penalty = self._collision_proximity_penalty()
         smoothness_penalty = float(np.mean(np.linalg.norm(actions - self.previous_actions, axis=1)))
         high_threat_bonus = float(np.sum(threat_scores_before_events[intercepted_now]))
+        approach_reward = self._assigned_target_approach_reward(
+            previous_defender_positions,
+            self.defender_positions,
+            previous_intruder_positions,
+            self.intruder_positions,
+            assigned_targets,
+        )
+        intercept_point_rewards = intercept_point_approach_reward(
+            previous_defender_positions,
+            self.defender_positions,
+            previous_intercept_points,
+            current_intercept_points,
+            assigned_targets,
+        )
+        blocking_rewards = blocking_position_reward(
+            self.defender_positions,
+            self.intruder_positions,
+            self.protected_asset,
+            assigned_targets,
+            self.config.blocking_sigma,
+        )
+        ttc_rewards = ttc_advantage_reward(
+            self.defender_positions,
+            self.intruder_positions,
+            self.intruder_velocities,
+            self.protected_asset,
+            current_intercept_points,
+            assigned_targets,
+            self.config.defender_max_speed,
+        )
+        progress_penalty = intruder_progress_penalty(
+            previous_intruder_positions,
+            self.intruder_positions,
+            self.protected_asset,
+            active_after_events,
+        )
+        duplicate_penalty = self._duplicate_assignment_penalty(assigned_targets)
+        collision_avoidance_weight = (
+            self.config.collision_avoidance_penalty
+            if self.config.collision_avoidance_penalty > 0.0
+            else self.config.collision_proximity_penalty
+        )
         team_reward = (
             float(np.sum(intercepted_now)) * self.config.intercept_reward
             + high_threat_bonus * self.config.high_threat_intercept_reward
             + dense_intercept_reward * self.config.dense_intercept_reward_scale
+            + float(np.mean(approach_reward)) * self.config.approach_reward_scale
+            + float(np.mean(intercept_point_rewards)) * self.config.intercept_point_approach_scale
+            + float(np.mean(blocking_rewards)) * self.config.blocking_position_scale
+            + float(np.mean(ttc_rewards)) * self.config.ttc_advantage_scale
             + float(np.sum(breached_now)) * self.config.breach_penalty
             - asset_risk_penalty * self.config.asset_risk_penalty
-            - proximity_penalty * self.config.collision_proximity_penalty
+            - proximity_penalty * collision_avoidance_weight
             - smoothness_penalty * self.config.action_smoothness_penalty
+            - progress_penalty * self.config.intruder_progress_penalty_scale
+            - duplicate_penalty * self.config.duplicate_assignment_penalty
             + self.config.step_penalty
         )
         threat_pressure = float(np.mean(self._threat_scores())) if self.config.num_intruders else 0.0
@@ -281,6 +375,39 @@ class CounterUAVEnv(gym.Env):
                 reward += self.config.collision_penalty
             rewards[agent] = float(reward)
         return rewards
+
+    def _assigned_target_approach_reward(
+        self,
+        previous_defender_positions: Array,
+        current_defender_positions: Array,
+        previous_intruder_positions: Array,
+        current_intruder_positions: Array,
+        assigned_targets: Array,
+    ) -> Array:
+        rewards = np.zeros(self.config.num_defenders, dtype=np.float32)
+        valid = assigned_targets >= 0
+        if not np.any(valid):
+            return rewards
+        defender_indices = np.where(valid)[0]
+        target_indices = assigned_targets[valid]
+        previous_distances = np.linalg.norm(
+            previous_defender_positions[defender_indices] - previous_intruder_positions[target_indices],
+            axis=1,
+        )
+        current_distances = np.linalg.norm(
+            current_defender_positions[defender_indices] - current_intruder_positions[target_indices],
+            axis=1,
+        )
+        rewards[defender_indices] = (previous_distances - current_distances).astype(np.float32)
+        return rewards
+
+    def _duplicate_assignment_penalty(self, assigned_targets: Array) -> float:
+        valid = assigned_targets[assigned_targets >= 0]
+        if len(valid) <= 1:
+            return 0.0
+        _, counts = np.unique(valid, return_counts=True)
+        duplicates = np.maximum(counts - 1, 0)
+        return float(np.sum(duplicates) / max(len(valid), 1))
 
     def _dense_intercept_reward(self, threat_scores: Array, active_mask: Array) -> float:
         if not np.any(active_mask):
@@ -326,6 +453,17 @@ class CounterUAVEnv(gym.Env):
         )
         threat_scores = self._threat_scores()
         intruder_threat = self._scalar_block(threat_scores, intruder_idx, self.config.nearest_intruders)
+        assigned_targets = self._assigned_targets(threat_scores)
+        assigned_target = int(assigned_targets[defender_idx])
+        if assigned_target >= 0:
+            intercept_points = self._predicted_intercept_points()
+            assigned_target_rel_pos = self.intruder_positions[assigned_target] - own_pos
+            assigned_target_threat = np.asarray([threat_scores[assigned_target]], dtype=np.float32)
+            assigned_intercept_point_rel_pos = intercept_points[assigned_target] - own_pos
+        else:
+            assigned_target_rel_pos = np.zeros(2, dtype=np.float32)
+            assigned_target_threat = np.zeros(1, dtype=np.float32)
+            assigned_intercept_point_rel_pos = np.zeros(2, dtype=np.float32)
 
         teammate_positions = np.delete(self.defender_positions, defender_idx, axis=0)
         teammate_velocities = np.delete(self.defender_velocities, defender_idx, axis=0)
@@ -349,6 +487,9 @@ class CounterUAVEnv(gym.Env):
                 teammate_rel_vel,
                 communication_available,
                 asset_rel_pos,
+                assigned_target_rel_pos,
+                assigned_target_threat,
+                assigned_intercept_point_rel_pos,
             ]
         )
         return observation.astype(np.float32)
@@ -369,8 +510,58 @@ class CounterUAVEnv(gym.Env):
             "breached": self.breached.copy(),
             "collision_events": list(self.collision_events),
             "communication_topology": self._communication_topology(),
+            "assigned_targets": self._assigned_targets(self._threat_scores()),
+            "predicted_intercept_points": self._predicted_intercept_points(),
+            "blocking_flags": self._blocking_flags(),
         }
         return {agent: dict(global_info) for agent in self.defense_agents}
+
+    def _predicted_intercept_points(
+        self,
+        intruder_positions: Array | None = None,
+        intruder_velocities: Array | None = None,
+    ) -> Array:
+        return predict_intercept_points(
+            self.intruder_positions if intruder_positions is None else intruder_positions,
+            self.intruder_velocities if intruder_velocities is None else intruder_velocities,
+            self.config.prediction_horizon,
+            self.config.world_size,
+        )
+
+    def _assigned_targets(self, threat_scores: Array) -> Array:
+        assignments = np.full(self.config.num_defenders, -1, dtype=np.int64)
+        active_indices = np.where(self.intruder_active)[0]
+        if len(active_indices) == 0:
+            return assignments
+        distances = np.linalg.norm(
+            self.defender_positions[:, None, :] - self.intruder_positions[active_indices][None, :, :],
+            axis=-1,
+        )
+        normalized_distances = distances / max(self.config.world_size, 1e-6)
+        scores = threat_scores[active_indices][None, :] - normalized_distances
+        target_use_counts = np.zeros(len(active_indices), dtype=np.int64)
+        for defender_idx in range(self.config.num_defenders):
+            ordered = np.argsort(-scores[defender_idx])
+            chosen = ordered[0]
+            for candidate in ordered:
+                if target_use_counts[candidate] == 0:
+                    chosen = candidate
+                    break
+            assignments[defender_idx] = int(active_indices[chosen])
+            target_use_counts[chosen] += 1
+        return assignments
+
+    def _blocking_flags(self) -> Array:
+        threat_scores = self._threat_scores()
+        assigned_targets = self._assigned_targets(threat_scores)
+        rewards = blocking_position_reward(
+            self.defender_positions,
+            self.intruder_positions,
+            self.protected_asset,
+            assigned_targets,
+            self.config.blocking_sigma,
+        )
+        return (rewards > 0.5).astype(np.float32)
 
     def _threat_scores(self) -> Array:
         scores = self.threat_model.score(self.intruder_positions, self.intruder_velocities, self.protected_asset)
@@ -440,7 +631,7 @@ class CounterUAVEnv(gym.Env):
     def _observation_dim(self) -> int:
         k_intruders = self.config.nearest_intruders
         k_teammates = self.config.nearest_teammates
-        return 2 + 2 + 1 + 2 * k_intruders + 2 * k_intruders + k_intruders + 2 * k_teammates + 2 * k_teammates + 1 + 2
+        return 2 + 2 + 1 + 2 * k_intruders + 2 * k_intruders + k_intruders + 2 * k_teammates + 2 * k_teammates + 1 + 2 + 2 + 1 + 2
 
     def _global_state_dim(self) -> int:
         return (
@@ -580,7 +771,18 @@ def config_from_mapping(env_data: dict[str, Any]) -> CounterUAVConfig:
         asset_risk_penalty=float(env_data.get("reward", {}).get("asset_risk_penalty", 0.0)),
         collision_proximity_penalty=float(env_data.get("reward", {}).get("collision_proximity_penalty", 0.0)),
         action_smoothness_penalty=float(env_data.get("reward", {}).get("action_smoothness_penalty", 0.0)),
-        action_magnitude_penalty=float(env_data.get("reward", {}).get("action_magnitude_penalty", 0.01)),
+        action_magnitude_penalty=float(
+            env_data.get("reward", {}).get("action_magnitude_penalty", env_data.get("reward", {}).get("energy", 0.01))
+        ),
+        approach_reward_scale=float(env_data.get("reward", {}).get("approach", 0.0)),
+        intercept_point_approach_scale=float(env_data.get("reward", {}).get("intercept_point_approach", 0.0)),
+        blocking_position_scale=float(env_data.get("reward", {}).get("blocking_position", 0.0)),
+        ttc_advantage_scale=float(env_data.get("reward", {}).get("ttc_advantage", 0.0)),
+        intruder_progress_penalty_scale=float(env_data.get("reward", {}).get("intruder_progress_penalty", 0.0)),
+        collision_avoidance_penalty=float(env_data.get("reward", {}).get("collision_avoidance", 0.0)),
+        duplicate_assignment_penalty=float(env_data.get("reward", {}).get("duplicate_assignment", 0.0)),
+        prediction_horizon=float(env_data.get("prediction_horizon", env_data.get("reward", {}).get("prediction_horizon", 8.0))),
+        blocking_sigma=float(env_data.get("blocking_sigma", env_data.get("reward", {}).get("blocking_sigma", 40.0))),
         separation_radius=float(env_data.get("separation_radius", env_data.get("collision_radius", 5.0) * 4.0)),
         intruder_behavior=str(env_data.get("intruder_behavior", "straight_attack")),
     )

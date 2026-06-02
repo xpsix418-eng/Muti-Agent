@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
+
+import torch
 
 import _bootstrap  # noqa: F401
 from algorithms.mappo.trainer import MAPPOConfig, MAPPOTrainer
@@ -20,6 +23,9 @@ def main() -> None:
 
     raw_config = load_yaml(args.config)
     env_config = load_env_config(resolve_env_config_path(args.config))
+    if "curriculum" in raw_config:
+        train_curriculum(raw_config, env_config, args.total_steps, args.checkpoint)
+        return
     scenario = args.scenario or raw_config.get("scenario", "ScenarioA")
     env = CounterUAVEnv(apply_scenario_to_config(env_config, scenario))
     trainer_config = build_trainer_config(raw_config, scenario, args.total_steps)
@@ -31,10 +37,52 @@ def main() -> None:
     print(f"checkpoint={Path(trainer_config.checkpoint_dir) / 'latest.pt'}")
 
 
+def train_curriculum(
+    raw_config: dict,
+    base_env_config,
+    total_steps_override: int | None,
+    checkpoint: str | None,
+) -> None:
+    stages = raw_config.get("curriculum", {}).get("stages", [])
+    if not stages:
+        raise ValueError("curriculum.stages must contain at least one stage")
+    previous_checkpoint = checkpoint
+    hidden_dim = int(raw_config.get("model", {}).get("hidden_dim", 128))
+    for stage in stages:
+        stage_name = str(stage["name"])
+        stage_steps = int(total_steps_override or stage.get("total_steps", raw_config.get("training", {}).get("total_steps", 100000)))
+        env_config = replace(
+            base_env_config,
+            num_defenders=int(stage.get("num_defenders", base_env_config.num_defenders)),
+            num_intruders=int(stage.get("num_intruders", base_env_config.num_intruders)),
+        )
+        env = CounterUAVEnv(env_config)
+        trainer_config = build_trainer_config(raw_config, stage_name, stage_steps)
+        trainer = MAPPOTrainer(env, trainer_config, hidden_dim=hidden_dim)
+        if previous_checkpoint:
+            load_actor_checkpoint_if_compatible(trainer, previous_checkpoint)
+        trainer.train()
+        previous_checkpoint = str(Path(trainer_config.checkpoint_dir) / "latest.pt")
+        print(f"stage={stage_name} checkpoint={previous_checkpoint}")
+
+
+def load_actor_checkpoint_if_compatible(trainer: MAPPOTrainer, checkpoint_path: str) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location=trainer.device, weights_only=False)
+    try:
+        trainer.actor.load_state_dict(checkpoint["actor"])
+        if "obs_rms" in checkpoint:
+            trainer.obs_rms.load_state_dict(checkpoint["obs_rms"])
+    except RuntimeError as exc:
+        raise RuntimeError(f"Cannot transfer actor from {checkpoint_path}: {exc}") from exc
+
+
 def build_trainer_config(raw_config: dict, scenario: str, total_steps_override: int | None) -> MAPPOConfig:
     training = raw_config.get("training", {})
     logging = raw_config.get("logging", {})
     total_steps = int(total_steps_override or training.get("total_steps", 100000))
+    learning_rate = float(training.get("learning_rate", 3e-4))
+    if learning_rate <= 0.0:
+        raise ValueError("learning_rate must be greater than 0.0")
     log_dir = str(logging.get("log_dir", "experiments/results/mappo"))
     scenario_log_dir = str(Path(log_dir) / scenario)
     return MAPPOConfig(
@@ -45,7 +93,7 @@ def build_trainer_config(raw_config: dict, scenario: str, total_steps_override: 
         clip_ratio=float(training.get("clip_ratio", 0.2)),
         entropy_coef=float(training.get("entropy_coef", 0.01)),
         value_coef=float(training.get("value_coef", 0.5)),
-        learning_rate=float(training.get("learning_rate", 3e-4)),
+        learning_rate=learning_rate,
         batch_size=int(training.get("batch_size", 1024)),
         epochs=int(training.get("epochs", 4)),
         max_grad_norm=float(training.get("max_grad_norm", 0.5)),

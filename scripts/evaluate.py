@@ -67,10 +67,15 @@ def evaluate_episode(
     previous_intercepted = np.zeros(env.config.num_intruders, dtype=bool)
     previous_breached = np.zeros(env.config.num_intruders, dtype=bool)
     intercept_times = np.full(env.config.num_intruders, np.nan, dtype=np.float32)
+    intercept_distances_to_asset: list[float] = []
+    intercept_time_to_asset: list[float] = []
 
     total_energy = 0.0
     total_collisions = 0
     total_communication_links = 0.0
+    total_defender_distance_to_asset = 0.0
+    total_blocking_flags = 0.0
+    total_blocking_denominator = 0.0
     steps = 0
 
     for _ in range(env.config.max_steps):
@@ -83,12 +88,24 @@ def evaluate_episode(
         newly_intercepted = intercepted & ~previous_intercepted
         newly_breached = breached & ~previous_breached
         intercept_times[newly_intercepted] = env.step_count
+        if np.any(newly_intercepted):
+            intercepted_positions = agent_info["intruder_positions"][newly_intercepted]
+            intercepted_velocities = agent_info["intruder_velocities"][newly_intercepted]
+            distances_to_asset = np.linalg.norm(intercepted_positions - env.protected_asset[None, :], axis=1)
+            speeds = np.maximum(np.linalg.norm(intercepted_velocities, axis=1), 1e-6)
+            intercept_distances_to_asset.extend(distances_to_asset.tolist())
+            intercept_time_to_asset.extend((distances_to_asset / speeds).tolist())
         previous_intercepted = intercepted
         previous_breached |= newly_breached
 
         total_energy += float(np.mean(np.linalg.norm(actions, axis=1)))
         total_collisions += len(agent_info["collision_events"])
         total_communication_links += communication_cost(agent_info["communication_topology"], metadata)
+        total_defender_distance_to_asset += float(
+            np.mean(np.linalg.norm(agent_info["defender_positions"] - env.protected_asset[None, :], axis=1))
+        )
+        total_blocking_flags += float(np.sum(agent_info.get("blocking_flags", np.zeros(env.config.num_defenders))))
+        total_blocking_denominator += float(env.config.num_defenders)
         steps += 1
         if terminations["__all__"] or truncations["__all__"]:
             break
@@ -108,6 +125,10 @@ def evaluate_episode(
         "collision_rate": float(total_collisions / max(steps, 1)),
         "communication_cost": float(total_communication_links / max(steps, 1)),
         "success_rate": success,
+        "average_defender_distance_to_asset": float(total_defender_distance_to_asset / max(steps, 1)),
+        "average_intercept_distance_to_asset": float(np.mean(intercept_distances_to_asset)) if intercept_distances_to_asset else float("nan"),
+        "average_intercept_time_to_asset": float(np.mean(intercept_time_to_asset)) if intercept_time_to_asset else float("nan"),
+        "blocking_success_rate": float(total_blocking_flags / max(total_blocking_denominator, 1.0)),
         "steps": float(steps),
     }
 

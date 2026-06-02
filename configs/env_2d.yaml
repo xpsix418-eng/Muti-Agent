@@ -1,0 +1,28 @@
+env:
+  name: counter_uav_2d
+  seed: 42
+  dim: 2
+  max_steps: 200
+  dt: 0.1
+  world_size: [100.0, 100.0]
+  num_defenders: 3
+  num_intruders: 2
+  defender_speed: 8.0
+  intruder_speed: 5.0
+  capture_radius: 2.5
+  protected_zone_radius: 8.0
+  observation_radius: 50.0
+  action:
+    type: continuous_velocity
+    max_acceleration: 4.0
+  reward:
+    capture: 10.0
+    protected_zone_breach: -20.0
+    distance_shaping: 0.05
+    energy_penalty: 0.01
+    step_penalty: -0.01
+  scenario:
+    name: random_2d
+    defender_spawn_radius: 10.0
+    intruder_spawn_min_radius: 35.0
+    intruder_spawn_max_radius: 48.0

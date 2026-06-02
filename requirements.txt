@@ -1,0 +1,8 @@
+numpy
+gymnasium
+pettingzoo
+matplotlib
+pyyaml
+scipy
+tensorboard
+pytest

@@ -1,0 +1,19 @@
+defaults:
+  env_config: configs/env_2d.yaml
+training:
+  seed: 42
+  total_steps: 100000
+  rollout_length: 256
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.2
+  learning_rate: 0.0003
+graph:
+  radius: 50.0
+  self_loops: true
+model:
+  node_dim: 8
+  hidden_dim: 128
+  message_passing_steps: 2
+logging:
+  log_dir: experiments/results/gnn_mappo

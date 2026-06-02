@@ -16,15 +16,18 @@ def main() -> None:
     args = parser.parse_args()
     env = CounterUAVEnv(load_env_config(args.config))
     _, info = env.reset(seed=42)
-    policy = NearestIntruderPolicy(env.config.defender_speed)
-    defender_trace = [info["defenders"]]
-    intruder_trace = [info["intruders"]]
+    policy = NearestIntruderPolicy(env.config.defender_max_speed)
+    first_info = info[env.defense_agents[0]]
+    defender_trace = [first_info["defender_positions"]]
+    intruder_trace = [first_info["intruder_positions"]]
     for _ in range(env.config.max_steps):
-        action = policy.act(info["defenders"], info["intruders"])
-        _, _, terminated, truncated, info = env.step(action)
-        defender_trace.append(info["defenders"])
-        intruder_trace.append(info["intruders"])
-        if terminated or truncated:
+        first_info = info[env.defense_agents[0]]
+        action = policy.act(first_info["defender_positions"], first_info["intruder_positions"])
+        _, _, terminations, truncations, info = env.step(action)
+        first_info = info[env.defense_agents[0]]
+        defender_trace.append(first_info["defender_positions"])
+        intruder_trace.append(first_info["intruder_positions"])
+        if terminations["__all__"] or truncations["__all__"]:
             break
     plt.figure(figsize=(6, 6))
     for positions in defender_trace:

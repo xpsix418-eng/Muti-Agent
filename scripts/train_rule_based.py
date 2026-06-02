@@ -15,13 +15,14 @@ def main() -> None:
     env = CounterUAVEnv(load_env_config(args.config))
     obs, info = env.reset(seed=42)
     del obs
-    policy = NearestIntruderPolicy(env.config.defender_speed)
+    policy = NearestIntruderPolicy(env.config.defender_max_speed)
     total_reward = 0.0
     for _ in range(env.config.max_steps):
-        action = policy.act(info["defenders"], info["intruders"])
-        _, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        if terminated or truncated:
+        first_info = info[env.defense_agents[0]]
+        action = policy.act(first_info["defender_positions"], first_info["intruder_positions"])
+        _, rewards, terminations, truncations, info = env.step(action)
+        total_reward += sum(rewards.values()) / len(rewards)
+        if terminations["__all__"] or truncations["__all__"]:
             break
     print(f"rule_based_total_reward={total_reward:.3f}")
 

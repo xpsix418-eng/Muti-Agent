@@ -17,10 +17,10 @@ def main() -> None:
     _, _ = env.reset(seed=42)
     total_reward = 0.0
     for _ in range(env.config.max_steps):
-        action = np.zeros(env.action_space.shape, dtype=np.float32)
-        _, reward, terminated, truncated, _ = env.step(action)
-        total_reward += reward
-        if terminated or truncated:
+        action = np.zeros((env.config.num_defenders, 2), dtype=np.float32)
+        _, rewards, terminations, truncations, _ = env.step(action)
+        total_reward += sum(rewards.values()) / len(rewards)
+        if terminations["__all__"] or truncations["__all__"]:
             break
     print(f"evaluation_total_reward={total_reward:.3f}")
 

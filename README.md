@@ -85,3 +85,9 @@ All examples use abstract point-mass agents, synthetic goals, synthetic threats,
 - `scripts/`: entry points for training, evaluation, and visualization.
 - `tests/`: lightweight regression tests.
 - `docs/`: method, environment, and experiment notes.
+
+## Environment API
+
+`CounterUAVEnv` exposes a multi-agent dict API. `reset(seed=None)` returns per-defender observations and info dictionaries. `step(actions)` accepts either a `{agent_id: [ax, ay]}` action mapping or a `(num_defenders, 2)` action array and returns `observations, rewards, terminations, truncations, infos`.
+
+Use `get_global_state()` for centralized critic inputs and `get_observation(agent_id)` for decentralized policy inputs.

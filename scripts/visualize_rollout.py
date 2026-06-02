@@ -10,25 +10,29 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Circle
 
 import _bootstrap  # noqa: F401
 from algorithms.hungarian_assignment import HungarianAssignmentPolicy
+from algorithms.mappo.actor import MLPActor
+from algorithms.mappo.utils import RunningMeanStd
 from algorithms.rule_based import RuleBasedPolicy
 from envs.config import load_env_config
 from envs.counter_uav_env import CounterUAVEnv
 from envs.scenarios import apply_scenario_to_config, initialize_scenario_state
 
 
-Policy = RuleBasedPolicy | HungarianAssignmentPolicy
+Policy = Any
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/env_2d.yaml")
-    parser.add_argument("--policy", choices=["rule_based", "hungarian"], default="rule_based")
+    parser.add_argument("--policy", choices=["rule_based", "hungarian", "mappo"], default="rule_based")
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--scenario", default="ScenarioB")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-steps", type=int, default=200)
@@ -36,7 +40,7 @@ def main() -> None:
     args = parser.parse_args()
 
     env = CounterUAVEnv(apply_scenario_to_config(load_env_config(args.config), args.scenario))
-    policy = build_policy(args.policy)
+    policy = build_policy(args.policy, env, args.checkpoint)
     rollout = collect_rollout(env, policy, args.scenario, seed=args.seed, max_steps=args.max_steps)
     output_dir = Path(args.output_dir or Path("experiments") / "results" / f"{args.policy}_{args.scenario}_rollout")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -46,7 +50,31 @@ def main() -> None:
     print(f"saved_gif={output_dir / 'rollout.gif'}")
 
 
-def build_policy(policy_name: str) -> Policy:
+class MAPPOVisualizationPolicy:
+    def __init__(self, checkpoint_path: str, env: CounterUAVEnv):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        obs_dim = env.observation_spaces[env.defense_agents[0]].shape[0]
+        hidden_dim = _infer_hidden_dim(checkpoint["actor"])
+        self.actor = MLPActor(obs_dim, 2, hidden_dim)
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.actor.eval()
+        self.obs_rms = RunningMeanStd((obs_dim,))
+        if "obs_rms" in checkpoint:
+            self.obs_rms.load_state_dict(checkpoint["obs_rms"])
+
+    def act(self, observations: dict[str, np.ndarray], agents: list[str]) -> np.ndarray:
+        obs = np.stack([observations[agent] for agent in agents]).astype(np.float32)
+        norm_obs = self.obs_rms.normalize(obs)
+        with torch.no_grad():
+            actions = self.actor.deterministic(torch.as_tensor(norm_obs, dtype=torch.float32)).cpu().numpy()
+        return np.clip(actions, -1.0, 1.0).astype(np.float32)
+
+
+def build_policy(policy_name: str, env: CounterUAVEnv, checkpoint_path: str | None = None) -> Policy:
+    if policy_name == "mappo":
+        if checkpoint_path is None:
+            raise ValueError("--policy mappo requires --checkpoint PATH")
+        return MAPPOVisualizationPolicy(checkpoint_path, env)
     if policy_name == "rule_based":
         return RuleBasedPolicy()
     if policy_name == "hungarian":
@@ -62,8 +90,9 @@ def collect_rollout(
     max_steps: int,
 ) -> dict[str, list[Any]]:
     rng = np.random.default_rng(seed)
-    _, info = env.reset(seed=seed)
+    observations, info = env.reset(seed=seed)
     initialize_scenario_state(env, scenario_name, rng)
+    observations = env._observations()
     info = env._infos()
     rollout: dict[str, list[Any]] = {
         "defenders": [],
@@ -81,9 +110,10 @@ def collect_rollout(
         previous_intercepted, previous_breached = append_frame(
             rollout, agent_info, previous_intercepted, previous_breached
         )
-        actions = policy_action(env, policy, agent_info)
-        _, _, terminations, truncations, info = env.step(actions)
+        actions = policy_action(env, policy, agent_info, observations=observations)
+        next_obs, _, terminations, truncations, info = env.step(actions)
         agent_info = info[env.defense_agents[0]]
+        observations = next_obs
         if terminations["__all__"] or truncations["__all__"]:
             append_frame(rollout, agent_info, previous_intercepted, previous_breached)
             break
@@ -107,7 +137,11 @@ def append_frame(
     return intercepted, breached
 
 
-def policy_action(env: CounterUAVEnv, policy: Policy, info: dict[str, Any]) -> np.ndarray:
+def policy_action(env: CounterUAVEnv, policy: Policy, info: dict[str, Any], observations: dict[str, np.ndarray] | None) -> np.ndarray:
+    if isinstance(policy, MAPPOVisualizationPolicy):
+        if observations is None:
+            observations = env._observations()
+        return policy.act(observations, env.defense_agents)
     common = {
         "defender_positions": info["defender_positions"],
         "defender_velocities": info["defender_velocities"],
@@ -120,6 +154,13 @@ def policy_action(env: CounterUAVEnv, policy: Policy, info: dict[str, Any]) -> n
     if isinstance(policy, HungarianAssignmentPolicy):
         return policy.act(intruder_velocities=info["intruder_velocities"], **common)
     return policy.act(**common)
+
+
+def _infer_hidden_dim(actor_state: dict[str, torch.Tensor]) -> int:
+    first_weight = actor_state.get("net.0.weight")
+    if first_weight is None:
+        return 128
+    return int(first_weight.shape[0])
 
 
 def save_trajectory_png(env: CounterUAVEnv, rollout: dict[str, list[Any]], path: Path) -> None:

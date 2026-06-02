@@ -70,6 +70,8 @@ class CounterUAVEnv(gym.Env):
         self.intercepted = np.zeros(self.config.num_intruders, dtype=bool)
         self.breached = np.zeros(self.config.num_intruders, dtype=bool)
         self.collision_events: list[tuple[str, str]] = []
+        self._render_fig: Any | None = None
+        self._render_ax: Any | None = None
         self.threat_model = ThreatModel(
             world_size=self.config.world_size,
             protected_radius=self.config.protected_radius,
@@ -160,16 +162,19 @@ class CounterUAVEnv(gym.Env):
 
     def render(self, mode: str = "human") -> Array | None:
         if mode == "human":
-            print(
-                f"step={self.step_count} active_intruders={int(np.sum(self.intruder_active))} "
-                f"breached={int(np.sum(self.breached))} intercepted={int(np.sum(self.intercepted))}"
-            )
+            self._render_matplotlib()
             return None
         if mode == "rgb_array":
             return self._render_rgb_array()
         raise ValueError(f"Unsupported render mode: {mode}")
 
     def close(self) -> None:
+        if self._render_fig is not None:
+            import matplotlib.pyplot as plt
+
+            plt.close(self._render_fig)
+            self._render_fig = None
+            self._render_ax = None
         return None
 
     def _update_defenders(self, actions: Array) -> None:
@@ -414,6 +419,56 @@ class CounterUAVEnv(gym.Env):
             color = (220, 40, 40) if self.intruder_active[idx] else (160, 160, 160)
             image[max(point[1] - 2, 0) : min(point[1] + 3, image_size), max(point[0] - 2, 0) : min(point[0] + 3, image_size)] = color
         return image
+
+    def _render_matplotlib(self) -> None:
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection
+        from matplotlib.patches import Circle
+
+        if self._render_fig is None or self._render_ax is None:
+            plt.ion()
+            self._render_fig, self._render_ax = plt.subplots(figsize=(7, 7))
+        ax = self._render_ax
+        ax.clear()
+        ax.set_xlim(0, self.config.world_size)
+        ax.set_ylim(0, self.config.world_size)
+        ax.set_aspect("equal")
+        ax.add_patch(Circle(self.protected_asset, self.config.protected_radius, fill=False, color="tab:green", linewidth=2))
+        ax.scatter([self.protected_asset[0]], [self.protected_asset[1]], c="tab:green", marker="*", s=160, label="protected asset")
+
+        topology = self._communication_topology()
+        rows, cols = np.where(np.triu(topology > 0.0, k=1))
+        segments = [[self.defender_positions[row], self.defender_positions[col]] for row, col in zip(rows.tolist(), cols.tolist())]
+        if segments:
+            ax.add_collection(LineCollection(segments, colors="tab:cyan", linewidths=0.8, alpha=0.4))
+
+        ax.scatter(self.defender_positions[:, 0], self.defender_positions[:, 1], c="tab:blue", s=45, label="defenders")
+        active = self.intruder_active
+        threats = self._threat_scores()
+        if np.any(active):
+            ax.scatter(
+                self.intruder_positions[active, 0],
+                self.intruder_positions[active, 1],
+                c=threats[active],
+                cmap="YlOrRd",
+                vmin=0.0,
+                vmax=1.0,
+                s=45,
+                label="active intruders",
+            )
+        inactive = ~active
+        if np.any(inactive):
+            ax.scatter(self.intruder_positions[inactive, 0], self.intruder_positions[inactive, 1], c="0.65", marker="x", s=45, label="inactive intruders")
+        ax.set_title(
+            f"step={self.step_count} active={int(np.sum(active))} "
+            f"intercepted={int(np.sum(self.intercepted))} breached={int(np.sum(self.breached))}"
+        )
+        ax.legend(loc="upper right", fontsize=8)
+        if "agg" in plt.get_backend().lower():
+            self._render_fig.canvas.draw()
+        else:
+            self._render_fig.canvas.draw_idle()
+            plt.pause(0.001)
 
 
 def _limit_speed(velocities: Array, max_speed: float) -> Array:

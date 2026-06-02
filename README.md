@@ -63,11 +63,32 @@ python scripts/evaluate.py --config configs/env_2d.yaml --policy rule_based --sc
 python scripts/evaluate.py --config configs/env_2d.yaml --policy hungarian --scenario ScenarioE
 ```
 
-Visualize a simulated rollout:
+## 如何可视化仿真环境
+
+`scripts/visualize_rollout.py` 会运行一次仿真回放，并保存：
+
+- `trajectory.png`: 静态轨迹图
+- `rollout.gif`: 动态回放 GIF
+
+Rule-based baseline:
 
 ```bash
 python scripts/visualize_rollout.py --config configs/env_2d.yaml --policy rule_based --scenario ScenarioB
 ```
+
+Hungarian assignment baseline:
+
+```bash
+python scripts/visualize_rollout.py --config configs/env_2d.yaml --policy hungarian --scenario ScenarioB
+```
+
+MAPPO checkpoint:
+
+```bash
+python scripts/visualize_rollout.py --config configs/env_2d.yaml --policy mappo --checkpoint experiments/results/mappo/ScenarioA/checkpoints/latest.pt --scenario ScenarioA
+```
+
+默认输出目录为 `experiments/results/{policy}_{scenario}_rollout/`，也可以通过 `--output-dir` 指定。交互式调试时可在 Python 中调用 `env.render(mode="human")` 打开实时 matplotlib 显示。
 
 ## Safety Boundary
 

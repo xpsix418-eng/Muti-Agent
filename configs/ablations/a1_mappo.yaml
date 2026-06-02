@@ -1,7 +1,7 @@
-scenario: ScenarioB
+scenario: Scenario5v5
 training:
   seed: 42
-  total_steps: 2000000
+  total_steps: 1000000
   rollout_length: 256
   num_envs: 1
   gamma: 0.99
@@ -26,8 +26,8 @@ env:
   name: counter_uav_2d
   seed: 42
   world_size: 1000.0
-  num_defenders: 8
-  num_intruders: 16
+  num_defenders: 5
+  num_intruders: 5
   max_steps: 500
   protected_asset_position: [500.0, 500.0]
   protected_radius: 80.0

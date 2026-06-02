@@ -41,6 +41,13 @@ class CounterUAVConfig:
     collision_penalty: float
     step_penalty: float
     threat_reward_scale: float
+    high_threat_intercept_reward: float = 0.0
+    dense_intercept_reward_scale: float = 0.0
+    asset_risk_penalty: float = 0.0
+    collision_proximity_penalty: float = 0.0
+    action_smoothness_penalty: float = 0.0
+    action_magnitude_penalty: float = 0.01
+    separation_radius: float = 20.0
     intruder_behavior: str = "straight_attack"
 
 
@@ -70,6 +77,7 @@ class CounterUAVEnv(gym.Env):
         self.intercepted = np.zeros(self.config.num_intruders, dtype=bool)
         self.breached = np.zeros(self.config.num_intruders, dtype=bool)
         self.collision_events: list[tuple[str, str]] = []
+        self.previous_actions = np.zeros((self.config.num_defenders, 2), dtype=np.float32)
         self._render_fig: Any | None = None
         self._render_ax: Any | None = None
         self.threat_model = ThreatModel(
@@ -111,6 +119,7 @@ class CounterUAVEnv(gym.Env):
         self.intercepted.fill(False)
         self.breached.fill(False)
         self.collision_events = []
+        self.previous_actions.fill(0.0)
         return self._observations(), self._infos()
 
     def step(
@@ -120,6 +129,7 @@ class CounterUAVEnv(gym.Env):
         self._update_defenders(action_array)
         self._update_intruders()
 
+        threat_scores_before_events = self._threat_scores()
         intercepted_now = self._detect_intercepts()
         breached_now = self._detect_breaches()
         collisions = self._detect_collisions()
@@ -128,7 +138,8 @@ class CounterUAVEnv(gym.Env):
 
         all_done = bool(np.all(~self.intruder_active) or np.any(self.breached))
         truncated = self.step_count >= self.config.max_steps
-        rewards = self._rewards(action_array, intercepted_now, breached_now, collisions)
+        rewards = self._rewards(action_array, intercepted_now, breached_now, collisions, threat_scores_before_events)
+        self.previous_actions = action_array.copy()
         terminations = {agent: all_done for agent in self.defense_agents}
         terminations["__all__"] = all_done
         truncations = {agent: truncated for agent in self.defense_agents}
@@ -242,14 +253,26 @@ class CounterUAVEnv(gym.Env):
         intercepted_now: Array,
         breached_now: Array,
         collisions: list[tuple[str, str]],
+        threat_scores_before_events: Array,
     ) -> dict[str, float]:
+        active_after_events = self.intruder_active.copy()
+        dense_intercept_reward = self._dense_intercept_reward(threat_scores_before_events, active_after_events)
+        asset_risk_penalty = self._asset_risk_penalty(threat_scores_before_events, active_after_events)
+        proximity_penalty = self._collision_proximity_penalty()
+        smoothness_penalty = float(np.mean(np.linalg.norm(actions - self.previous_actions, axis=1)))
+        high_threat_bonus = float(np.sum(threat_scores_before_events[intercepted_now]))
         team_reward = (
             float(np.sum(intercepted_now)) * self.config.intercept_reward
+            + high_threat_bonus * self.config.high_threat_intercept_reward
+            + dense_intercept_reward * self.config.dense_intercept_reward_scale
             + float(np.sum(breached_now)) * self.config.breach_penalty
+            - asset_risk_penalty * self.config.asset_risk_penalty
+            - proximity_penalty * self.config.collision_proximity_penalty
+            - smoothness_penalty * self.config.action_smoothness_penalty
             + self.config.step_penalty
         )
         threat_pressure = float(np.mean(self._threat_scores())) if self.config.num_intruders else 0.0
-        energy_penalty = 0.01 * np.linalg.norm(actions, axis=1)
+        energy_penalty = self.config.action_magnitude_penalty * np.linalg.norm(actions, axis=1)
         rewards = {}
         collision_agents = {agent for pair in collisions for agent in pair}
         for idx, agent in enumerate(self.defense_agents):
@@ -258,6 +281,38 @@ class CounterUAVEnv(gym.Env):
                 reward += self.config.collision_penalty
             rewards[agent] = float(reward)
         return rewards
+
+    def _dense_intercept_reward(self, threat_scores: Array, active_mask: Array) -> float:
+        if not np.any(active_mask):
+            return 0.0
+        active_positions = self.intruder_positions[active_mask]
+        active_threats = threat_scores[active_mask]
+        distances = np.linalg.norm(self.defender_positions[:, None, :] - active_positions[None, :, :], axis=-1)
+        closest_defender_distances = np.min(distances, axis=0)
+        closeness = 1.0 - np.clip(closest_defender_distances / max(self.config.world_size, 1e-6), 0.0, 1.0)
+        return float(np.mean(active_threats * closeness))
+
+    def _asset_risk_penalty(self, threat_scores: Array, active_mask: Array) -> float:
+        if not np.any(active_mask):
+            return 0.0
+        active_positions = self.intruder_positions[active_mask]
+        active_threats = threat_scores[active_mask]
+        distances = np.linalg.norm(active_positions - self.protected_asset[None, :], axis=1)
+        risk = 1.0 - np.clip(distances / max(self.config.world_size, 1e-6), 0.0, 1.0)
+        return float(np.mean(active_threats * risk))
+
+    def _collision_proximity_penalty(self) -> float:
+        if self.config.num_defenders < 2:
+            return 0.0
+        distances = np.linalg.norm(
+            self.defender_positions[:, None, :] - self.defender_positions[None, :, :],
+            axis=-1,
+        )
+        pair_mask = np.triu(np.ones_like(distances, dtype=bool), k=1)
+        risky = (distances < self.config.separation_radius) & pair_mask
+        if not np.any(risky):
+            return 0.0
+        return float(np.mean((self.config.separation_radius - distances[risky]) / max(self.config.separation_radius, 1e-6)))
 
     def _agent_observation(self, defender_idx: int) -> Array:
         own_pos = self.defender_positions[defender_idx]
@@ -520,6 +575,13 @@ def config_from_mapping(env_data: dict[str, Any]) -> CounterUAVConfig:
         collision_penalty=float(env_data.get("reward", {}).get("collision", -2.0)),
         step_penalty=float(env_data.get("reward", {}).get("step", -0.01)),
         threat_reward_scale=float(env_data.get("reward", {}).get("threat_scale", 0.1)),
+        high_threat_intercept_reward=float(env_data.get("reward", {}).get("high_threat_intercept", 0.0)),
+        dense_intercept_reward_scale=float(env_data.get("reward", {}).get("dense_intercept_scale", 0.0)),
+        asset_risk_penalty=float(env_data.get("reward", {}).get("asset_risk_penalty", 0.0)),
+        collision_proximity_penalty=float(env_data.get("reward", {}).get("collision_proximity_penalty", 0.0)),
+        action_smoothness_penalty=float(env_data.get("reward", {}).get("action_smoothness_penalty", 0.0)),
+        action_magnitude_penalty=float(env_data.get("reward", {}).get("action_magnitude_penalty", 0.01)),
+        separation_radius=float(env_data.get("separation_radius", env_data.get("collision_radius", 5.0) * 4.0)),
         intruder_behavior=str(env_data.get("intruder_behavior", "straight_attack")),
     )
 

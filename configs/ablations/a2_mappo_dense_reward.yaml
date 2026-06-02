@@ -7,9 +7,9 @@ training:
   gamma: 0.99
   gae_lambda: 0.95
   clip_ratio: 0.2
-  entropy_coef: 0.01
+  entropy_coef: 0.005
   value_coef: 0.5
-  learning_rate: 0.0003
+  learning_rate: 0.00025
   batch_size: 2048
   epochs: 6
   max_grad_norm: 0.5
@@ -21,7 +21,7 @@ model:
   hidden_dim: 128
   activation: tanh
 logging:
-  log_dir: experiments/results/ablations/A2_mappo_threat_reward
+  log_dir: experiments/results/ablations/A2_mappo_dense_reward
 env:
   name: counter_uav_2d
   seed: 42
@@ -39,6 +39,7 @@ env:
   nearest_teammates: 3
   communication_radius: 250.0
   collision_radius: 5.0
+  separation_radius: 25.0
   defender_acceleration_scale: 4.0
   intruder_behavior: straight_attack
   initial_energy: 100.0
@@ -47,8 +48,14 @@ env:
     type: continuous_acceleration
     range: [-1.0, 1.0]
   reward:
-    intercept: 10.0
-    breach: -25.0
-    collision: -2.0
-    step: -0.01
-    threat_scale: 0.1
+    intercept: 12.0
+    high_threat_intercept: 6.0
+    breach: -30.0
+    collision: -4.0
+    step: -0.005
+    threat_scale: 0.08
+    dense_intercept_scale: 3.0
+    asset_risk_penalty: 1.0
+    collision_proximity_penalty: 1.5
+    action_smoothness_penalty: 0.05
+    action_magnitude_penalty: 0.008

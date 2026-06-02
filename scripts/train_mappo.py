@@ -13,7 +13,7 @@ from envs.scenarios import apply_scenario_to_config
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/train_mappo.yaml")
-    parser.add_argument("--scenario", choices=["ScenarioA", "ScenarioB"], default=None)
+    parser.add_argument("--scenario", default=None)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--checkpoint", default=None)
     args = parser.parse_args()

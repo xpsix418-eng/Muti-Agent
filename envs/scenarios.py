@@ -9,7 +9,7 @@ from envs.counter_uav_env import CounterUAVConfig
 
 
 Array = np.ndarray
-ScenarioName = Literal["ScenarioA", "ScenarioB", "ScenarioC", "ScenarioD", "ScenarioE", "ScenarioF"]
+ScenarioName = Literal["Scenario5v5", "ScenarioA", "ScenarioB", "ScenarioC", "ScenarioD", "ScenarioE", "ScenarioF"]
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,7 @@ class ScenarioSpec:
 
 
 SCENARIOS: dict[str, ScenarioSpec] = {
+    "Scenario5v5": ScenarioSpec("Scenario5v5", "Five defenders versus five intruders scenario", 5, 5),
     "ScenarioA": ScenarioSpec("ScenarioA", "Small-scale basic scenario", 4, 8),
     "ScenarioB": ScenarioSpec("ScenarioB", "Medium-scale cooperation scenario", 8, 16),
     "ScenarioC": ScenarioSpec("ScenarioC", "Large-scale stress scenario", 16, 32),

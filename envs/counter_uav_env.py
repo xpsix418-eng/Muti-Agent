@@ -63,6 +63,8 @@ class CounterUAVConfig:
     intruder_progress_penalty_scale: float = 0.0
     collision_avoidance_penalty: float = 0.0
     duplicate_assignment_penalty: float = 0.0
+    assignment_guidance_scale: float = 0.0
+    assignment_guidance_sigma: float = 120.0
     prediction_horizon: float = 8.0
     blocking_sigma: float = 40.0
     separation_radius: float = 20.0
@@ -344,6 +346,11 @@ class CounterUAVEnv(gym.Env):
             active_after_events,
         )
         duplicate_penalty = self._duplicate_assignment_penalty(assigned_targets)
+        assignment_guidance = self._assignment_guidance_reward(
+            assigned_targets,
+            current_intercept_points,
+            threat_scores_before_events,
+        )
         collision_avoidance_weight = (
             self.config.collision_avoidance_penalty
             if self.config.collision_avoidance_penalty > 0.0
@@ -357,6 +364,7 @@ class CounterUAVEnv(gym.Env):
             + float(np.mean(intercept_point_rewards)) * self.config.intercept_point_approach_scale
             + float(np.mean(blocking_rewards)) * self.config.blocking_position_scale
             + float(np.mean(ttc_rewards)) * self.config.ttc_advantage_scale
+            + assignment_guidance * self.config.assignment_guidance_scale
             + float(np.sum(breached_now)) * self.config.breach_penalty
             - asset_risk_penalty * self.config.asset_risk_penalty
             - proximity_penalty * collision_avoidance_weight
@@ -408,6 +416,18 @@ class CounterUAVEnv(gym.Env):
         _, counts = np.unique(valid, return_counts=True)
         duplicates = np.maximum(counts - 1, 0)
         return float(np.sum(duplicates) / max(len(valid), 1))
+
+    def _assignment_guidance_reward(self, assigned_targets: Array, intercept_points: Array, threat_scores: Array) -> float:
+        valid = assigned_targets >= 0
+        if not np.any(valid):
+            return 0.0
+        defender_indices = np.where(valid)[0]
+        target_indices = assigned_targets[valid]
+        distances = np.linalg.norm(self.defender_positions[defender_indices] - intercept_points[target_indices], axis=1)
+        proximity = np.exp(-distances / max(self.config.assignment_guidance_sigma, 1e-6))
+        threat_weights = np.clip(threat_scores[target_indices], 0.0, 1.0)
+        covered_targets = len(np.unique(target_indices)) / max(np.sum(self.intruder_active), 1)
+        return float(np.mean(proximity * (0.5 + threat_weights)) + covered_targets)
 
     def _dense_intercept_reward(self, threat_scores: Array, active_mask: Array) -> float:
         if not np.any(active_mask):
@@ -781,6 +801,8 @@ def config_from_mapping(env_data: dict[str, Any]) -> CounterUAVConfig:
         intruder_progress_penalty_scale=float(env_data.get("reward", {}).get("intruder_progress_penalty", 0.0)),
         collision_avoidance_penalty=float(env_data.get("reward", {}).get("collision_avoidance", 0.0)),
         duplicate_assignment_penalty=float(env_data.get("reward", {}).get("duplicate_assignment", 0.0)),
+        assignment_guidance_scale=float(env_data.get("reward", {}).get("assignment_guidance", 0.0)),
+        assignment_guidance_sigma=float(env_data.get("assignment_guidance_sigma", env_data.get("reward", {}).get("assignment_guidance_sigma", 120.0))),
         prediction_horizon=float(env_data.get("prediction_horizon", env_data.get("reward", {}).get("prediction_horizon", 8.0))),
         blocking_sigma=float(env_data.get("blocking_sigma", env_data.get("reward", {}).get("blocking_sigma", 40.0))),
         separation_radius=float(env_data.get("separation_radius", env_data.get("collision_radius", 5.0) * 4.0)),

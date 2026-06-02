@@ -9,7 +9,7 @@ training:
   clip_ratio: 0.2
   entropy_coef: 0.01
   value_coef: 0.5
-  learning_rate: 0.0003
+  learning_rate: 0.00025
   batch_size: 2048
   epochs: 6
   max_grad_norm: 0.5

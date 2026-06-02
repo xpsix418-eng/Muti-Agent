@@ -4,9 +4,15 @@ training:
   seed: 42
   total_steps: 100000
   option_horizon: 10
+  high_level_interval: 10
   high_level_lr: 0.0003
   low_level_lr: 0.0003
 hierarchy:
+  cooperation_modes:
+    - intercept
+    - block
+    - hold
+    - regroup
   options:
     - guard_zone
     - pursue_nearest

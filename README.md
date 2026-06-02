@@ -54,6 +54,9 @@ MAPPO scaffold:
 ```bash
 python scripts/train_mappo.py --config configs/train_mappo.yaml --scenario ScenarioA
 python scripts/train_mappo.py --config configs/train_mappo.yaml --scenario ScenarioB
+python scripts/train_gnn_mappo.py --config configs/train_gnn_mappo.yaml --scenario ScenarioA
+python scripts/train_hierarchical_marl.py --config configs/train_hierarchical_marl.yaml --scenario ScenarioA
+python scripts/run_ablation.py --mappo-checkpoint experiments/results/mappo/ScenarioA/checkpoints/latest.pt
 ```
 
 Evaluate a random or rule-based policy:

@@ -11,8 +11,9 @@ training:
 graph:
   radius: 50.0
   self_loops: true
+  message_passing_steps: 2
 model:
-  node_dim: 8
+  node_dim: 10
   hidden_dim: 128
   message_passing_steps: 2
 logging:

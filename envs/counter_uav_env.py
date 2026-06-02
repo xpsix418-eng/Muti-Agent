@@ -9,6 +9,10 @@ import numpy as np
 import yaml
 from gymnasium import spaces
 
+from envs.dynamics import DynamicsConfig, update_defender_dynamics, update_intruder_dynamics
+from envs.reward import detect_breaches, detect_defender_collisions, detect_intercepts
+from envs.threat_model import ThreatModel
+
 
 Array = np.ndarray
 
@@ -37,6 +41,7 @@ class CounterUAVConfig:
     collision_penalty: float
     step_penalty: float
     threat_reward_scale: float
+    intruder_behavior: str = "straight_attack"
 
 
 class CounterUAVEnv(gym.Env):
@@ -65,6 +70,11 @@ class CounterUAVEnv(gym.Env):
         self.intercepted = np.zeros(self.config.num_intruders, dtype=bool)
         self.breached = np.zeros(self.config.num_intruders, dtype=bool)
         self.collision_events: list[tuple[str, str]] = []
+        self.threat_model = ThreatModel(
+            world_size=self.config.world_size,
+            protected_radius=self.config.protected_radius,
+            intruder_max_speed=self.config.intruder_max_speed,
+        )
 
         obs_dim = self._observation_dim()
         state_dim = self._global_state_dim()
@@ -163,20 +173,28 @@ class CounterUAVEnv(gym.Env):
         return None
 
     def _update_defenders(self, actions: Array) -> None:
-        acceleration = np.clip(actions, -1.0, 1.0) * self.config.defender_acceleration_scale
         active_energy = (self.defender_energy > 0.0).astype(np.float32)[:, None]
-        self.defender_velocities += acceleration * self.config.dt * active_energy
-        self.defender_velocities = _limit_speed(self.defender_velocities, self.config.defender_max_speed)
-        self.defender_positions += self.defender_velocities * self.config.dt * active_energy
-        self.defender_positions = np.clip(self.defender_positions, 0.0, self.config.world_size)
+        self.defender_positions, self.defender_velocities = update_defender_dynamics(
+            self.defender_positions,
+            self.defender_velocities,
+            actions * active_energy,
+            self._dynamics_config(),
+        )
+        acceleration = np.clip(actions, -1.0, 1.0) * self.config.defender_acceleration_scale
         energy_delta = self.config.energy_cost * np.linalg.norm(acceleration, axis=1) * self.config.dt
         self.defender_energy = np.maximum(0.0, self.defender_energy - energy_delta.astype(np.float32))
 
     def _update_intruders(self) -> None:
-        self.intruder_velocities = self._intruder_guidance()
-        active = self.intruder_active.astype(np.float32)[:, None]
-        self.intruder_positions += self.intruder_velocities * self.config.dt * active
-        self.intruder_positions = np.clip(self.intruder_positions, 0.0, self.config.world_size)
+        self.intruder_positions, self.intruder_velocities = update_intruder_dynamics(
+            self.intruder_positions,
+            self.intruder_velocities,
+            self.protected_asset,
+            self.defender_positions,
+            self._dynamics_config(),
+            behavior=self.config.intruder_behavior,  # type: ignore[arg-type]
+            rng=self.rng,
+            active_mask=self.intruder_active,
+        )
 
     def _intruder_guidance(self) -> Array:
         direction = self.protected_asset[None, :] - self.intruder_positions
@@ -186,33 +204,32 @@ class CounterUAVEnv(gym.Env):
         return velocity.astype(np.float32)
 
     def _detect_intercepts(self) -> Array:
-        distances = np.linalg.norm(
-            self.defender_positions[:, None, :] - self.intruder_positions[None, :, :], axis=-1
+        intercepted_now, _ = detect_intercepts(
+            self.defender_positions,
+            self.intruder_positions,
+            self.config.intercept_radius,
         )
-        intercepted_now = (distances.min(axis=0) <= self.config.intercept_radius) & self.intruder_active
+        intercepted_now &= self.intruder_active
         self.intercepted |= intercepted_now
         self.intruder_active[intercepted_now] = False
         self.intruder_velocities[intercepted_now] = 0.0
         return intercepted_now
 
     def _detect_breaches(self) -> Array:
-        distances = np.linalg.norm(self.intruder_positions - self.protected_asset[None, :], axis=1)
-        breached_now = (distances <= self.config.protected_radius) & self.intruder_active
+        breached_now = detect_breaches(
+            self.intruder_positions,
+            self.protected_asset,
+            self.config.protected_radius,
+        )
+        breached_now &= self.intruder_active
         self.breached |= breached_now
         self.intruder_active[breached_now] = False
         self.intruder_velocities[breached_now] = 0.0
         return breached_now
 
     def _detect_collisions(self) -> list[tuple[str, str]]:
-        collisions: list[tuple[str, str]] = []
-        distances = np.linalg.norm(
-            self.defender_positions[:, None, :] - self.defender_positions[None, :, :], axis=-1
-        )
-        pair_mask = np.triu(np.ones_like(distances, dtype=bool), k=1)
-        rows, cols = np.where((distances <= self.config.collision_radius) & pair_mask)
-        for row, col in zip(rows.tolist(), cols.tolist()):
-            collisions.append((self.defense_agents[row], self.defense_agents[col]))
-        return collisions
+        pairs = detect_defender_collisions(self.defender_positions, self.config.collision_radius)
+        return [(self.defense_agents[row], self.defense_agents[col]) for row, col in pairs]
 
     def _rewards(
         self,
@@ -295,11 +312,18 @@ class CounterUAVEnv(gym.Env):
         return {agent: dict(global_info) for agent in self.defense_agents}
 
     def _threat_scores(self) -> Array:
-        distances = np.linalg.norm(self.intruder_positions - self.protected_asset[None, :], axis=1)
-        normalized = 1.0 - distances / max(self.config.world_size, 1e-6)
-        scores = np.clip(normalized, 0.0, 1.0)
+        scores = self.threat_model.score(self.intruder_positions, self.intruder_velocities, self.protected_asset)
         scores[~self.intruder_active] = 0.0
         return scores.astype(np.float32)
+
+    def _dynamics_config(self) -> DynamicsConfig:
+        return DynamicsConfig(
+            dt=self.config.dt,
+            world_size=self.config.world_size,
+            defender_max_speed=self.config.defender_max_speed,
+            intruder_max_speed=self.config.intruder_max_speed,
+            defender_acceleration_scale=self.config.defender_acceleration_scale,
+        )
 
     def _communication_topology(self) -> Array:
         distances = np.linalg.norm(
@@ -440,6 +464,7 @@ def config_from_mapping(env_data: dict[str, Any]) -> CounterUAVConfig:
         collision_penalty=float(env_data.get("reward", {}).get("collision", -2.0)),
         step_penalty=float(env_data.get("reward", {}).get("step", -0.01)),
         threat_reward_scale=float(env_data.get("reward", {}).get("threat_scale", 0.1)),
+        intruder_behavior=str(env_data.get("intruder_behavior", "straight_attack")),
     )
 
 

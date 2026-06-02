@@ -16,6 +16,7 @@ env:
   communication_radius: 250.0
   collision_radius: 5.0
   defender_acceleration_scale: 4.0
+  intruder_behavior: straight_attack
   initial_energy: 100.0
   energy_cost: 0.05
   action:

@@ -1,15 +1,16 @@
 scenario: Scenario5v5
 training:
   seed: 42
-  total_steps: 1000000
+  total_steps: 2000000
   rollout_length: 256
   num_envs: 1
   gamma: 0.99
   gae_lambda: 0.95
   clip_ratio: 0.2
-  entropy_coef: 0.01
+  entropy_coef: 0.008
   value_coef: 0.5
-  learning_rate: 0.00025
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
   batch_size: 2048
   epochs: 6
   max_grad_norm: 0.5

@@ -27,6 +27,7 @@ class MAPPOConfig:
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     learning_rate: float = 3e-4
+    min_learning_rate: float = 0.0
     batch_size: int = 1024
     epochs: int = 4
     max_grad_norm: float = 0.5
@@ -223,7 +224,12 @@ class MAPPOTrainer:
         for update_idx in range(updates):
             progress_remaining = 1.0 - update_idx / max(updates, 1)
             if self.config.lr_schedule:
-                linear_lr_schedule(self.optimizer, self.config.learning_rate, progress_remaining)
+                linear_lr_schedule(
+                    self.optimizer,
+                    self.config.learning_rate,
+                    progress_remaining,
+                    self.config.min_learning_rate,
+                )
             rollout_metrics = self.collect_rollouts()
             update_metrics = self.update()
             self._log_train_metrics({**rollout_metrics, **update_metrics})

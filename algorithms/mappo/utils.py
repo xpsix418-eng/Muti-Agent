@@ -25,8 +25,13 @@ def clip_gradients(module: nn.Module, max_norm: float) -> float:
     return float(torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm).item())
 
 
-def linear_lr_schedule(optimizer: Optimizer, initial_lr: float, progress_remaining: float) -> float:
-    lr = initial_lr * max(progress_remaining, 0.0)
+def linear_lr_schedule(
+    optimizer: Optimizer,
+    initial_lr: float,
+    progress_remaining: float,
+    min_lr: float = 0.0,
+) -> float:
+    lr = max(initial_lr * max(progress_remaining, 0.0), min_lr)
     for group in optimizer.param_groups:
         group["lr"] = lr
     return lr

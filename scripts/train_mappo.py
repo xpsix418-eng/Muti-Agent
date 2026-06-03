@@ -83,6 +83,11 @@ def build_trainer_config(raw_config: dict, scenario: str, total_steps_override: 
     learning_rate = float(training.get("learning_rate", 3e-4))
     if learning_rate <= 0.0:
         raise ValueError("learning_rate must be greater than 0.0")
+    min_learning_rate = float(training.get("min_learning_rate", 0.0))
+    if min_learning_rate < 0.0:
+        raise ValueError("min_learning_rate must be non-negative")
+    if min_learning_rate > learning_rate:
+        raise ValueError("min_learning_rate must be less than or equal to learning_rate")
     log_dir = str(logging.get("log_dir", "experiments/results/mappo"))
     scenario_log_dir = str(Path(log_dir) / scenario)
     return MAPPOConfig(
@@ -94,6 +99,7 @@ def build_trainer_config(raw_config: dict, scenario: str, total_steps_override: 
         entropy_coef=float(training.get("entropy_coef", 0.01)),
         value_coef=float(training.get("value_coef", 0.5)),
         learning_rate=learning_rate,
+        min_learning_rate=min_learning_rate,
         batch_size=int(training.get("batch_size", 1024)),
         epochs=int(training.get("epochs", 4)),
         max_grad_norm=float(training.get("max_grad_norm", 0.5)),

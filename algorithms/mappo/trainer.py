@@ -91,9 +91,12 @@ class MAPPOTrainer:
         energy_costs: list[float] = []
         intercept_rates: list[float] = []
         breach_rates: list[float] = []
+        blocking_rates: list[float] = []
         current_episode_reward = 0.0
         current_episode_energy = 0.0
         current_episode_collisions = 0.0
+        current_episode_blocking = 0.0
+        current_episode_blocking_denominator = 0.0
         current_episode_steps = 0
 
         for _ in range(self.config.rollout_length):
@@ -108,6 +111,8 @@ class MAPPOTrainer:
             log_probs = log_prob_tensor.cpu().numpy()
             values = value_tensor.cpu().numpy()
 
+            if hasattr(self.env, "set_training_step"):
+                self.env.set_training_step(self.global_step)
             next_obs, rewards_dict, terminations, truncations, next_info = self.env.step(actions)
             rewards = np.asarray([rewards_dict[agent] for agent in self.agents], dtype=np.float32)
             if self.config.reward_normalization:
@@ -121,23 +126,35 @@ class MAPPOTrainer:
             current_episode_reward += raw_episode_reward
             current_episode_energy += float(np.mean(np.linalg.norm(actions, axis=1)))
             current_episode_collisions += len(next_info[self.agents[0]]["collision_events"])
+            current_episode_blocking += float(np.sum(next_info[self.agents[0]].get("blocking_flags", np.zeros(self.num_agents))))
+            current_episode_blocking_denominator += float(self.num_agents)
             current_episode_steps += 1
             self.global_step += self.num_agents
             self.current_obs = next_obs
             self.current_info = next_info
 
             if done:
-                metrics = self._terminal_metrics(current_episode_reward, current_episode_energy, current_episode_collisions, current_episode_steps)
+                metrics = self._terminal_metrics(
+                    current_episode_reward,
+                    current_episode_energy,
+                    current_episode_collisions,
+                    current_episode_blocking,
+                    current_episode_blocking_denominator,
+                    current_episode_steps,
+                )
                 episode_rewards.append(metrics["episode_reward"])
                 energy_costs.append(metrics["average_energy_cost"])
                 collision_counts.append(metrics["collision_rate"])
                 intercept_rates.append(metrics["intercept_rate"])
                 breach_rates.append(metrics["breach_rate"])
+                blocking_rates.append(metrics["blocking_success_rate"])
                 self._log_episode_metrics(metrics)
                 self.current_obs, self.current_info = self.env.reset(seed=self.config.seed + self.episode_count + 1)
                 current_episode_reward = 0.0
                 current_episode_energy = 0.0
                 current_episode_collisions = 0.0
+                current_episode_blocking = 0.0
+                current_episode_blocking_denominator = 0.0
                 current_episode_steps = 0
 
         last_obs, last_state = self._arrays_from_current_state()
@@ -152,6 +169,7 @@ class MAPPOTrainer:
             "breach_rate": float(np.mean(breach_rates)) if breach_rates else 0.0,
             "collision_rate": float(np.mean(collision_counts)) if collision_counts else 0.0,
             "average_energy_cost": float(np.mean(energy_costs)) if energy_costs else 0.0,
+            "blocking_success_rate": float(np.mean(blocking_rates)) if blocking_rates else 0.0,
         }
         return self.last_rollout_metrics
 
@@ -254,7 +272,15 @@ class MAPPOTrainer:
             return self.obs_rms.normalize(obs), self.state_rms.normalize(states)
         return obs, states
 
-    def _terminal_metrics(self, reward: float, energy: float, collisions: float, steps: int) -> dict[str, float]:
+    def _terminal_metrics(
+        self,
+        reward: float,
+        energy: float,
+        collisions: float,
+        blocking: float,
+        blocking_denominator: float,
+        steps: int,
+    ) -> dict[str, float]:
         info = self.current_info[self.agents[0]]
         intercepted = np.asarray(info["intercepted"], dtype=bool)
         breached = np.asarray(info["breached"], dtype=bool)
@@ -264,6 +290,7 @@ class MAPPOTrainer:
             "breach_rate": float(np.mean(breached)),
             "collision_rate": float(collisions / max(steps, 1)),
             "average_energy_cost": float(energy / max(steps, 1)),
+            "blocking_success_rate": float(blocking / max(blocking_denominator, 1.0)),
         }
         self.episode_count += 1
         return metrics

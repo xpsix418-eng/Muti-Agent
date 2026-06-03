@@ -65,6 +65,15 @@ class CounterUAVConfig:
     duplicate_assignment_penalty: float = 0.0
     assignment_guidance_scale: float = 0.0
     assignment_guidance_sigma: float = 120.0
+    assignment_weight_start: float = 0.0
+    assignment_weight_end: float = 0.0
+    assignment_decay_steps: int = 1_000_000
+    assignment_update_interval: int = 10
+    early_intercept_weight: float = 0.0
+    intercept_time_margin_weight: float = 0.0
+    prediction_horizon_mode: str = "fixed"
+    min_prediction_tau: float = 3.0
+    max_prediction_tau: float = 10.0
     prediction_horizon: float = 8.0
     blocking_sigma: float = 40.0
     separation_radius: float = 20.0
@@ -100,6 +109,10 @@ class CounterUAVEnv(gym.Env):
         self.previous_actions = np.zeros((self.config.num_defenders, 2), dtype=np.float32)
         self.previous_defender_positions = self.defender_positions.copy()
         self.previous_intruder_positions = self.intruder_positions.copy()
+        self.training_step = 0
+        self._assignment_cache_step = -1
+        self._assignment_cache_scores = np.zeros(self.config.num_intruders, dtype=np.float32)
+        self._assignment_cache = np.full(self.config.num_defenders, -1, dtype=np.int64)
         self._render_fig: Any | None = None
         self._render_ax: Any | None = None
         self.threat_model = ThreatModel(
@@ -144,7 +157,13 @@ class CounterUAVEnv(gym.Env):
         self.previous_actions.fill(0.0)
         self.previous_defender_positions = self.defender_positions.copy()
         self.previous_intruder_positions = self.intruder_positions.copy()
+        self._assignment_cache_step = -1
+        self._assignment_cache_scores = np.zeros(self.config.num_intruders, dtype=np.float32)
+        self._assignment_cache = np.full(self.config.num_defenders, -1, dtype=np.int64)
         return self._observations(), self._infos()
+
+    def set_training_step(self, step: int) -> None:
+        self.training_step = max(int(step), 0)
 
     def step(
         self, actions: dict[str, Array] | Array
@@ -160,6 +179,7 @@ class CounterUAVEnv(gym.Env):
         assigned_targets = self._assigned_targets(threat_scores_before_events)
         previous_intercept_points = self._predicted_intercept_points(previous_intruder_positions, previous_intruder_velocities)
         current_intercept_points = self._predicted_intercept_points()
+        intruder_velocities_before_events = self.intruder_velocities.copy()
         intercepted_now = self._detect_intercepts()
         breached_now = self._detect_breaches()
         collisions = self._detect_collisions()
@@ -179,6 +199,7 @@ class CounterUAVEnv(gym.Env):
             previous_intruder_positions,
             previous_intercept_points,
             current_intercept_points,
+            intruder_velocities_before_events,
         )
         self.previous_actions = action_array.copy()
         self.previous_defender_positions = previous_defender_positions
@@ -302,6 +323,7 @@ class CounterUAVEnv(gym.Env):
         previous_intruder_positions: Array,
         previous_intercept_points: Array,
         current_intercept_points: Array,
+        intruder_velocities_before_events: Array,
     ) -> dict[str, float]:
         active_after_events = self.intruder_active.copy()
         dense_intercept_reward = self._dense_intercept_reward(threat_scores_before_events, active_after_events)
@@ -351,6 +373,8 @@ class CounterUAVEnv(gym.Env):
             current_intercept_points,
             threat_scores_before_events,
         )
+        early_intercept_bonus = self._early_intercept_bonus(intercepted_now)
+        intercept_time_margin_bonus = self._intercept_time_margin_bonus(intercepted_now, intruder_velocities_before_events)
         collision_avoidance_weight = (
             self.config.collision_avoidance_penalty
             if self.config.collision_avoidance_penalty > 0.0
@@ -365,6 +389,8 @@ class CounterUAVEnv(gym.Env):
             + float(np.mean(blocking_rewards)) * self.config.blocking_position_scale
             + float(np.mean(ttc_rewards)) * self.config.ttc_advantage_scale
             + assignment_guidance * self.config.assignment_guidance_scale
+            + early_intercept_bonus
+            + intercept_time_margin_bonus
             + float(np.sum(breached_now)) * self.config.breach_penalty
             - asset_risk_penalty * self.config.asset_risk_penalty
             - proximity_penalty * collision_avoidance_weight
@@ -383,6 +409,21 @@ class CounterUAVEnv(gym.Env):
                 reward += self.config.collision_penalty
             rewards[agent] = float(reward)
         return rewards
+
+    def _early_intercept_bonus(self, intercepted_now: Array) -> float:
+        if self.config.early_intercept_weight <= 0.0 or not np.any(intercepted_now):
+            return 0.0
+        distances = np.linalg.norm(self.intruder_positions[intercepted_now] - self.protected_asset[None, :], axis=1)
+        normalized = distances / max(self.config.world_size, 1e-6)
+        return float(self.config.early_intercept_weight * np.sum(normalized))
+
+    def _intercept_time_margin_bonus(self, intercepted_now: Array, intruder_velocities_before_events: Array) -> float:
+        if self.config.intercept_time_margin_weight <= 0.0 or not np.any(intercepted_now):
+            return 0.0
+        distances = np.linalg.norm(self.intruder_positions[intercepted_now] - self.protected_asset[None, :], axis=1)
+        speeds = np.maximum(np.linalg.norm(intruder_velocities_before_events[intercepted_now], axis=1), 1e-6)
+        time_to_asset = distances / speeds
+        return float(self.config.intercept_time_margin_weight * np.sum(time_to_asset))
 
     def _assigned_target_approach_reward(
         self,
@@ -427,7 +468,17 @@ class CounterUAVEnv(gym.Env):
         proximity = np.exp(-distances / max(self.config.assignment_guidance_sigma, 1e-6))
         threat_weights = np.clip(threat_scores[target_indices], 0.0, 1.0)
         covered_targets = len(np.unique(target_indices)) / max(np.sum(self.intruder_active), 1)
-        return float(np.mean(proximity * (0.5 + threat_weights)) + covered_targets)
+        return float(self._current_assignment_weight() * (np.mean(proximity * (0.5 + threat_weights)) + covered_targets))
+
+    def _current_assignment_weight(self) -> float:
+        if self.config.assignment_weight_start <= 0.0 and self.config.assignment_weight_end <= 0.0:
+            return 1.0
+        decay_steps = max(int(self.config.assignment_decay_steps), 1)
+        progress = min(float(self.training_step) / float(decay_steps), 1.0)
+        return float(
+            self.config.assignment_weight_start
+            + progress * (self.config.assignment_weight_end - self.config.assignment_weight_start)
+        )
 
     def _dense_intercept_reward(self, threat_scores: Array, active_mask: Array) -> float:
         if not np.any(active_mask):
@@ -541,27 +592,47 @@ class CounterUAVEnv(gym.Env):
         intruder_positions: Array | None = None,
         intruder_velocities: Array | None = None,
     ) -> Array:
+        positions = self.intruder_positions if intruder_positions is None else intruder_positions
+        velocities = self.intruder_velocities if intruder_velocities is None else intruder_velocities
+        if self.config.prediction_horizon_mode == "dynamic":
+            distances = np.linalg.norm(self.defender_positions[:, None, :] - positions[None, :, :], axis=-1)
+            nearest_distances = np.min(distances, axis=0)
+            tau = nearest_distances / max(self.config.defender_max_speed, 1e-6)
+            tau = np.clip(tau, self.config.min_prediction_tau, self.config.max_prediction_tau).astype(np.float32)
+            return np.clip(positions + velocities * tau[:, None], 0.0, self.config.world_size).astype(np.float32)
         return predict_intercept_points(
-            self.intruder_positions if intruder_positions is None else intruder_positions,
-            self.intruder_velocities if intruder_velocities is None else intruder_velocities,
+            positions,
+            velocities,
             self.config.prediction_horizon,
             self.config.world_size,
         )
 
     def _assigned_targets(self, threat_scores: Array) -> Array:
+        if (
+            self.config.assignment_update_interval > 1
+            and self._assignment_cache_step >= 0
+            and self.step_count - self._assignment_cache_step < self.config.assignment_update_interval
+            and self._assignment_cache_scores.shape == threat_scores.shape
+        ):
+            return self._assignment_cache.copy()
         assignments = np.full(self.config.num_defenders, -1, dtype=np.int64)
         active_indices = np.where(self.intruder_active)[0]
         if len(active_indices) == 0:
             return assignments
-        distances = np.linalg.norm(
-            self.defender_positions[:, None, :] - self.intruder_positions[active_indices][None, :, :],
-            axis=-1,
+        intercept_points = self._predicted_intercept_points()[active_indices]
+        distances = np.linalg.norm(self.defender_positions[:, None, :] - intercept_points[None, :, :], axis=-1)
+        time_to_intercept = distances / max(self.config.defender_max_speed, 1e-6)
+        distance_cost = distances / max(self.config.world_size, 1e-6)
+        heading_mismatch = self._heading_mismatch(active_indices)
+        cost = (
+            0.45 * time_to_intercept
+            + 0.25 * distance_cost
+            - 0.20 * threat_scores[active_indices][None, :]
+            + 0.10 * heading_mismatch[None, :]
         )
-        normalized_distances = distances / max(self.config.world_size, 1e-6)
-        scores = threat_scores[active_indices][None, :] - normalized_distances
         target_use_counts = np.zeros(len(active_indices), dtype=np.int64)
         for defender_idx in range(self.config.num_defenders):
-            ordered = np.argsort(-scores[defender_idx])
+            ordered = np.argsort(cost[defender_idx])
             chosen = ordered[0]
             for candidate in ordered:
                 if target_use_counts[candidate] == 0:
@@ -569,7 +640,19 @@ class CounterUAVEnv(gym.Env):
                     break
             assignments[defender_idx] = int(active_indices[chosen])
             target_use_counts[chosen] += 1
+        self._assignment_cache_step = self.step_count
+        self._assignment_cache_scores = threat_scores.copy()
+        self._assignment_cache = assignments.copy()
         return assignments
+
+    def _heading_mismatch(self, active_indices: Array) -> Array:
+        velocities = self.intruder_velocities[active_indices]
+        to_asset = self.protected_asset[None, :] - self.intruder_positions[active_indices]
+        velocity_norms = np.linalg.norm(velocities, axis=1)
+        asset_norms = np.linalg.norm(to_asset, axis=1)
+        denom = np.maximum(velocity_norms * asset_norms, 1e-6)
+        alignment = np.sum(velocities * to_asset, axis=1) / denom
+        return (1.0 - np.clip(alignment, -1.0, 1.0)).astype(np.float32)
 
     def _blocking_flags(self) -> Array:
         threat_scores = self._threat_scores()
@@ -803,6 +886,15 @@ def config_from_mapping(env_data: dict[str, Any]) -> CounterUAVConfig:
         duplicate_assignment_penalty=float(env_data.get("reward", {}).get("duplicate_assignment", 0.0)),
         assignment_guidance_scale=float(env_data.get("reward", {}).get("assignment_guidance", 0.0)),
         assignment_guidance_sigma=float(env_data.get("assignment_guidance_sigma", env_data.get("reward", {}).get("assignment_guidance_sigma", 120.0))),
+        assignment_weight_start=float(env_data.get("assignment_weight_start", env_data.get("reward", {}).get("assignment_weight_start", 0.0))),
+        assignment_weight_end=float(env_data.get("assignment_weight_end", env_data.get("reward", {}).get("assignment_weight_end", 0.0))),
+        assignment_decay_steps=int(env_data.get("assignment_decay_steps", env_data.get("reward", {}).get("assignment_decay_steps", 1_000_000))),
+        assignment_update_interval=int(env_data.get("assignment_update_interval", env_data.get("reward", {}).get("assignment_update_interval", 10))),
+        early_intercept_weight=float(env_data.get("reward", {}).get("early_intercept_weight", 0.0)),
+        intercept_time_margin_weight=float(env_data.get("reward", {}).get("intercept_time_margin_weight", 0.0)),
+        prediction_horizon_mode=str(env_data.get("prediction_horizon_mode", env_data.get("reward", {}).get("prediction_horizon_mode", "fixed"))),
+        min_prediction_tau=float(env_data.get("min_tau", env_data.get("reward", {}).get("min_tau", 3.0))),
+        max_prediction_tau=float(env_data.get("max_tau", env_data.get("reward", {}).get("max_tau", 10.0))),
         prediction_horizon=float(env_data.get("prediction_horizon", env_data.get("reward", {}).get("prediction_horizon", 8.0))),
         blocking_sigma=float(env_data.get("blocking_sigma", env_data.get("reward", {}).get("blocking_sigma", 40.0))),
         separation_radius=float(env_data.get("separation_radius", env_data.get("collision_radius", 5.0) * 4.0)),

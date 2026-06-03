@@ -92,7 +92,8 @@ def evaluate_episode(
             intercepted_positions = agent_info["intruder_positions"][newly_intercepted]
             intercepted_velocities = agent_info["intruder_velocities"][newly_intercepted]
             distances_to_asset = np.linalg.norm(intercepted_positions - env.protected_asset[None, :], axis=1)
-            speeds = np.maximum(np.linalg.norm(intercepted_velocities, axis=1), 1e-6)
+            speeds = np.linalg.norm(intercepted_velocities, axis=1)
+            speeds = np.where(speeds < 1e-6, env.config.intruder_max_speed, speeds)
             intercept_distances_to_asset.extend(distances_to_asset.tolist())
             intercept_time_to_asset.extend((distances_to_asset / speeds).tolist())
         previous_intercepted = intercepted

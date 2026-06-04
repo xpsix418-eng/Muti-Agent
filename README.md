@@ -8,8 +8,8 @@ The project is intentionally limited to numerical simulation. It does not connec
 
 - Multi-agent simulation environment for cooperative control research.
 - Baseline rule-based coordination and assignment.
-- Extensible MAPPO, GNN-MAPPO, and hierarchical MARL modules.
-- Unit tests for environment reset/step, rewards, threat modeling, and graph construction.
+- MAPPO, graph-based MAPPO, and hierarchical MARL research modules.
+- Unit tests for environment reset/step, rewards, threat modeling, graph construction, and evaluation metrics.
 
 ## Install
 
@@ -62,19 +62,37 @@ A3 intercept-point reward curriculum:
 python scripts/train_mappo.py --config configs/train_mappo_a3_intercept_point.yaml
 ```
 
-Evaluate a random or rule-based policy:
+IPG-MAPPO current main method:
+
+```bash
+python scripts/train_ipga_mappo.py --config configs/train_ipg_mappo_5v5.yaml
+```
+
+`IPG-MAPPO` is the current tentative final method. It keeps the Interception Prediction Graph, interception-point nodes, Interception-Time Advantage edge feature, graph encoder, and MAPPO backbone. `IPG-MAPPO + Assignment Gate` is treated as an ablation unless the assignment gate is repaired and consistently outperforms IPG-MAPPO.
+
+Strict validation:
+
+```bash
+python scripts/run_ipg_validation.py
+python scripts/run_ipg_multiseed.py
+```
+
+Evaluate a policy:
 
 ```bash
 python scripts/evaluate.py --config configs/env_2d.yaml --policy rule_based --scenario ScenarioB
 python scripts/evaluate.py --config configs/env_2d.yaml --policy hungarian --scenario ScenarioE
+python scripts/evaluate.py --config configs/train_ipg_mappo_5v5.yaml --policy ipga_mappo --checkpoint experiments/results/ipg_mappo/Scenario5v5/checkpoints/latest.pt --scenario Scenario5v5
 ```
 
-## 如何可视化仿真环境
+## Visualization
 
-`scripts/visualize_rollout.py` 会运行一次仿真回放，并保存：
+`scripts/visualize_rollout.py` runs one simulated rollout and saves:
 
-- `trajectory.png`: 静态轨迹图
-- `rollout.gif`: 动态回放 GIF
+- `trajectory.png`: static trajectory figure.
+- `rollout.gif`: animated rollout.
+- `ipga_assignment.png`: graph-method interception points and assignment/attention overlay.
+- `ipga_rollout.gif`: graph-method enhanced animation.
 
 Rule-based baseline:
 
@@ -94,7 +112,19 @@ MAPPO checkpoint:
 python scripts/visualize_rollout.py --config configs/env_2d.yaml --policy mappo --checkpoint experiments/results/mappo/ScenarioA/checkpoints/latest.pt --scenario ScenarioA
 ```
 
-默认输出目录为 `experiments/results/{policy}_{scenario}_rollout/`，也可以通过 `--output-dir` 指定。交互式调试时可在 Python 中调用 `env.render(mode="human")` 打开实时 matplotlib 显示。
+IPG-MAPPO checkpoint:
+
+```bash
+python scripts/visualize_rollout.py --config configs/train_ipg_mappo_5v5.yaml --policy ipga_mappo --checkpoint experiments/results/ipg_mappo/Scenario5v5/checkpoints/latest.pt --scenario Scenario5v5
+```
+
+The default output directory is `experiments/results/{policy}_{scenario}_rollout/`; pass `--output-dir` to choose another location. For interactive debugging, call `env.render(mode="human")` from Python to open a live matplotlib view.
+
+## Metrics
+
+- `intercept_rate = intercepted_intruders / total_intruders`; each intruder is counted once per episode.
+- `success_rate = 1` only if all intruders are intercepted and no breach occurs in the episode.
+- `collision_rate` is reported per episode step.
 
 ## Safety Boundary
 

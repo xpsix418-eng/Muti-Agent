@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--experiment-name", default=None)
+    parser.add_argument("--stochastic", action="store_true")
     args = parser.parse_args()
 
     raw_config = load_extended_yaml(args.config)
@@ -45,7 +46,14 @@ def main() -> None:
     policy = build_policy(args.policy, env, args.checkpoint)
     metadata = scenario_metadata(args.scenario)
     episode_rows = [
-        evaluate_episode(env, policy, args.scenario, seed=args.seed + idx, metadata=metadata)
+        evaluate_episode(
+            env,
+            policy,
+            args.scenario,
+            seed=args.seed + idx,
+            metadata=metadata,
+            deterministic=not args.stochastic,
+        )
         for idx in range(args.episodes)
     ]
     metrics = summarize_metrics(episode_rows, env, metadata)
@@ -82,12 +90,23 @@ class MAPPOEvaluationPolicy:
         if "obs_rms" in checkpoint:
             self.obs_rms.load_state_dict(checkpoint["obs_rms"])
 
-    def act(self, observations: dict[str, np.ndarray], agents: list[str], info: dict[str, Any]) -> tuple[np.ndarray, dict[str, float]]:
+    def act(
+        self,
+        observations: dict[str, np.ndarray],
+        agents: list[str],
+        info: dict[str, Any],
+        deterministic: bool = True,
+    ) -> tuple[np.ndarray, dict[str, float]]:
         del info
         obs = np.stack([observations[agent] for agent in agents]).astype(np.float32)
         norm_obs = self.obs_rms.normalize(obs)
         with torch.no_grad():
-            actions = self.actor.deterministic(torch.as_tensor(norm_obs, dtype=torch.float32)).cpu().numpy()
+            obs_tensor = torch.as_tensor(norm_obs, dtype=torch.float32)
+            if deterministic:
+                actions = self.actor.deterministic(obs_tensor).cpu().numpy()
+            else:
+                actions, _, _ = self.actor.sample(obs_tensor)
+                actions = actions.cpu().numpy()
         return np.clip(actions, -1.0, 1.0).astype(np.float32), {}
 
 
@@ -132,7 +151,13 @@ class IPGAEvaluationPolicy:
         self.use_assignment_gate = bool(cfg.get("use_assignment_gate", True))
         self.use_ita_features = bool(cfg.get("use_ita_features", True))
 
-    def act(self, observations: dict[str, np.ndarray], agents: list[str], info: dict[str, Any]) -> tuple[np.ndarray, dict[str, float]]:
+    def act(
+        self,
+        observations: dict[str, np.ndarray],
+        agents: list[str],
+        info: dict[str, Any],
+        deterministic: bool = True,
+    ) -> tuple[np.ndarray, dict[str, float]]:
         obs = np.stack([observations[agent] for agent in agents]).astype(np.float32)
         norm_obs = self.obs_rms.normalize(obs)
         graph = self.builder.build(info)
@@ -156,11 +181,12 @@ class IPGAEvaluationPolicy:
                 context = torch.zeros_like(context)
             elif not self.use_assignment_gate:
                 context = torch.zeros_like(context)
-            actions = self.actor.deterministic(
-                torch.as_tensor(norm_obs, dtype=torch.float32),
-                defender_embeddings[0],
-                context[0],
-            ).cpu().numpy()
+            obs_tensor = torch.as_tensor(norm_obs, dtype=torch.float32)
+            if deterministic:
+                actions = self.actor.deterministic(obs_tensor, defender_embeddings[0], context[0]).cpu().numpy()
+            else:
+                actions, _, _ = self.actor.sample(obs_tensor, defender_embeddings[0], context[0])
+                actions = actions.cpu().numpy()
         diagnostics = {
             "assignment_entropy": assignment_entropy(weights.cpu().numpy()),
             "mean_interception_time_advantage": mean_interception_time_advantage(graph.interception_time_advantage),
@@ -175,6 +201,7 @@ def evaluate_episode(
     scenario_name: str,
     seed: int,
     metadata: dict[str, float | int | str],
+    deterministic: bool = True,
 ) -> dict[str, float]:
     rng = np.random.default_rng(seed)
     observations, info = env.reset(seed=seed)
@@ -202,7 +229,7 @@ def evaluate_episode(
 
     for _ in range(env.config.max_steps):
         agent_info = info[env.defense_agents[0]]
-        actions, diagnostics = policy_action(env, policy, agent_info, observations)
+        actions, diagnostics = policy_action(env, policy, agent_info, observations, deterministic=deterministic)
         observations, _, terminations, truncations, info = env.step(actions)
         agent_info = info[env.defense_agents[0]]
         intercepted = np.asarray(agent_info["intercepted"], dtype=bool)
@@ -267,9 +294,10 @@ def policy_action(
     policy: Policy,
     info: dict[str, Any],
     observations: dict[str, np.ndarray],
+    deterministic: bool = True,
 ) -> tuple[np.ndarray, dict[str, float]]:
     if isinstance(policy, (MAPPOEvaluationPolicy, IPGAEvaluationPolicy)):
-        return policy.act(observations, env.defense_agents, info)
+        return policy.act(observations, env.defense_agents, info, deterministic=deterministic)
     common = {
         "defender_positions": info["defender_positions"],
         "defender_velocities": info["defender_velocities"],

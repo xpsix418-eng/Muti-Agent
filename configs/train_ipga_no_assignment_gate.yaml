@@ -1,5 +1,5 @@
 scenario: Scenario5v5
-algorithm: IPGA-MAPPO-no-assignment-gate
+algorithm: IPG-MAPPO-legacy-no-assignment-gate
 extends: configs/train_ipga_mappo_5v5.yaml
 training:
   total_env_steps: 2000000

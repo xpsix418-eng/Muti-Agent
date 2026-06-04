@@ -10,7 +10,6 @@ import numpy as np
 import torch
 
 import _bootstrap  # noqa: F401
-from algorithms.hungarian_assignment import HungarianAssignmentPolicy
 from algorithms.ipga_mappo.actor import IPGAActor
 from algorithms.ipga_mappo.critic import IPGACritic
 from algorithms.ipga_mappo.graph_encoder import InterceptionGraphEncoder
@@ -19,7 +18,6 @@ from algorithms.ipga_mappo.soft_assignment_gate import SoftAssignmentGate
 from algorithms.ipga_mappo.utils import assignment_entropy, graph_attention_sparsity, mean_interception_time_advantage
 from algorithms.mappo.actor import MLPActor
 from algorithms.mappo.utils import RunningMeanStd
-from algorithms.rule_based import RuleBasedPolicy
 from envs.config import config_from_mapping, load_env_config, load_yaml
 from envs.counter_uav_env import CounterUAVEnv
 from envs.scenarios import apply_scenario_to_config, initialize_scenario_state, scenario_metadata
@@ -31,7 +29,7 @@ Policy = Any
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/env_2d.yaml")
-    parser.add_argument("--policy", choices=["rule_based", "hungarian", "mappo", "ipga_mappo"], default="rule_based")
+    parser.add_argument("--policy", choices=["mappo", "ipga_mappo"], default="mappo")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--scenario", default="ScenarioB")
     parser.add_argument("--episodes", type=int, default=10)
@@ -71,10 +69,6 @@ def build_policy(policy_name: str, env: CounterUAVEnv, checkpoint_path: str | No
         if checkpoint_path is None:
             raise ValueError("--policy ipga_mappo requires --checkpoint PATH")
         return IPGAEvaluationPolicy(checkpoint_path, env)
-    if policy_name == "rule_based":
-        return RuleBasedPolicy()
-    if policy_name == "hungarian":
-        return HungarianAssignmentPolicy()
     raise ValueError(f"Unsupported policy: {policy_name}")
 
 
@@ -313,18 +307,7 @@ def policy_action(
 ) -> tuple[np.ndarray, dict[str, float]]:
     if isinstance(policy, (MAPPOEvaluationPolicy, IPGAEvaluationPolicy)):
         return policy.act(observations, env.defense_agents, info, deterministic=deterministic)
-    common = {
-        "defender_positions": info["defender_positions"],
-        "defender_velocities": info["defender_velocities"],
-        "intruder_positions": info["intruder_positions"],
-        "intruder_active": ~(info["intercepted"] | info["breached"]),
-        "threat_scores": info["threat_scores"],
-        "protected_asset_position": env.protected_asset,
-        "world_size": env.config.world_size,
-    }
-    if isinstance(policy, HungarianAssignmentPolicy):
-        return policy.act(intruder_velocities=info["intruder_velocities"], **common), {}
-    return policy.act(**common), {}
+    raise TypeError(f"Unsupported policy instance: {type(policy).__name__}")
 
 
 def communication_cost(topology: np.ndarray, metadata: dict[str, float | int | str]) -> float:

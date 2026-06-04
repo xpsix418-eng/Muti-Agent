@@ -7,31 +7,42 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 import _bootstrap  # noqa: F401
 from algorithms.hungarian_assignment import HungarianAssignmentPolicy
+from algorithms.ipga_mappo.actor import IPGAActor
+from algorithms.ipga_mappo.critic import IPGACritic
+from algorithms.ipga_mappo.graph_encoder import InterceptionGraphEncoder
+from algorithms.ipga_mappo.interception_graph import InterceptionGraphBuilder
+from algorithms.ipga_mappo.soft_assignment_gate import SoftAssignmentGate
+from algorithms.ipga_mappo.utils import assignment_entropy, graph_attention_sparsity, mean_interception_time_advantage
+from algorithms.mappo.actor import MLPActor
+from algorithms.mappo.utils import RunningMeanStd
 from algorithms.rule_based import RuleBasedPolicy
-from envs.config import load_env_config
+from envs.config import config_from_mapping, load_env_config, load_yaml
 from envs.counter_uav_env import CounterUAVEnv
 from envs.scenarios import apply_scenario_to_config, initialize_scenario_state, scenario_metadata
 
 
-Policy = RuleBasedPolicy | HungarianAssignmentPolicy
+Policy = Any
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/env_2d.yaml")
-    parser.add_argument("--policy", choices=["rule_based", "hungarian"], default="rule_based")
+    parser.add_argument("--policy", choices=["rule_based", "hungarian", "mappo", "ipga_mappo"], default="rule_based")
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--scenario", default="ScenarioB")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--experiment-name", default=None)
     args = parser.parse_args()
 
-    base_config = load_env_config(args.config)
+    raw_config = load_extended_yaml(args.config)
+    base_config = config_from_mapping(raw_config["env"]) if "env" in raw_config else load_env_config(args.config)
     env = CounterUAVEnv(apply_scenario_to_config(base_config, args.scenario))
-    policy = build_policy(args.policy)
+    policy = build_policy(args.policy, env, args.checkpoint)
     metadata = scenario_metadata(args.scenario)
     episode_rows = [
         evaluate_episode(env, policy, args.scenario, seed=args.seed + idx, metadata=metadata)
@@ -43,12 +54,108 @@ def main() -> None:
     print(json.dumps(metrics, indent=2))
 
 
-def build_policy(policy_name: str) -> Policy:
+def build_policy(policy_name: str, env: CounterUAVEnv, checkpoint_path: str | None = None) -> Policy:
+    if policy_name == "mappo":
+        if checkpoint_path is None:
+            raise ValueError("--policy mappo requires --checkpoint PATH")
+        return MAPPOEvaluationPolicy(checkpoint_path, env)
+    if policy_name == "ipga_mappo":
+        if checkpoint_path is None:
+            raise ValueError("--policy ipga_mappo requires --checkpoint PATH")
+        return IPGAEvaluationPolicy(checkpoint_path, env)
     if policy_name == "rule_based":
         return RuleBasedPolicy()
     if policy_name == "hungarian":
         return HungarianAssignmentPolicy()
     raise ValueError(f"Unsupported policy: {policy_name}")
+
+
+class MAPPOEvaluationPolicy:
+    def __init__(self, checkpoint_path: str, env: CounterUAVEnv):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        obs_dim = env.observation_spaces[env.defense_agents[0]].shape[0]
+        hidden_dim = _infer_hidden_dim(checkpoint["actor"])
+        self.actor = MLPActor(obs_dim, 2, hidden_dim)
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.actor.eval()
+        self.obs_rms = RunningMeanStd((obs_dim,))
+        if "obs_rms" in checkpoint:
+            self.obs_rms.load_state_dict(checkpoint["obs_rms"])
+
+    def act(self, observations: dict[str, np.ndarray], agents: list[str], info: dict[str, Any]) -> tuple[np.ndarray, dict[str, float]]:
+        del info
+        obs = np.stack([observations[agent] for agent in agents]).astype(np.float32)
+        norm_obs = self.obs_rms.normalize(obs)
+        with torch.no_grad():
+            actions = self.actor.deterministic(torch.as_tensor(norm_obs, dtype=torch.float32)).cpu().numpy()
+        return np.clip(actions, -1.0, 1.0).astype(np.float32), {}
+
+
+class IPGAEvaluationPolicy:
+    def __init__(self, checkpoint_path: str, env: CounterUAVEnv):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        cfg = checkpoint.get("config", {})
+        obs_dim = env.observation_spaces[env.defense_agents[0]].shape[0]
+        state_dim = env.state_space.shape[0]
+        graph_dim = int(cfg.get("graph_hidden_dim", 128))
+        hidden_dim = int(cfg.get("hidden_dim", 128))
+        self.builder = InterceptionGraphBuilder(
+            env.config.world_size,
+            env.config.defender_max_speed,
+            env.config.intruder_max_speed,
+            float(cfg.get("prediction_horizon", 5.0)),
+        )
+        sample = self.builder.build(env._infos()[env.defense_agents[0]])
+        self.edge_index = torch.as_tensor(sample.edge_index, dtype=torch.long)
+        self.graph_encoder = InterceptionGraphEncoder(
+            sample.node_features.shape[1],
+            sample.edge_features.shape[1],
+            graph_dim,
+            int(cfg.get("num_graph_layers", 2)),
+            int(cfg.get("attention_heads", 4)),
+        )
+        self.assignment_gate = SoftAssignmentGate(graph_dim, sample.edge_features.shape[1], hidden_dim)
+        self.actor = IPGAActor(obs_dim, graph_dim, 2, hidden_dim)
+        self.critic = IPGACritic(state_dim, graph_dim, hidden_dim)
+        self.graph_encoder.load_state_dict(checkpoint["graph_encoder"])
+        self.assignment_gate.load_state_dict(checkpoint["assignment_gate"])
+        self.actor.load_state_dict(checkpoint["actor"])
+        if "critic" in checkpoint:
+            self.critic.load_state_dict(checkpoint["critic"])
+        self.graph_encoder.eval()
+        self.assignment_gate.eval()
+        self.actor.eval()
+        self.obs_rms = RunningMeanStd((obs_dim,))
+        if "obs_rms" in checkpoint:
+            self.obs_rms.load_state_dict(checkpoint["obs_rms"])
+
+    def act(self, observations: dict[str, np.ndarray], agents: list[str], info: dict[str, Any]) -> tuple[np.ndarray, dict[str, float]]:
+        obs = np.stack([observations[agent] for agent in agents]).astype(np.float32)
+        norm_obs = self.obs_rms.normalize(obs)
+        graph = self.builder.build(info)
+        node_features = torch.as_tensor(graph.node_features[None, :, :], dtype=torch.float32)
+        edge_features = torch.as_tensor(graph.edge_features[None, :, :], dtype=torch.float32)
+        pair_features = torch.as_tensor(graph.pair_edge_features[None, :, :, :], dtype=torch.float32)
+        with torch.no_grad():
+            node_embeddings, _, attention = self.graph_encoder(node_features, self.edge_index, edge_features)
+            num_defenders = len(agents)
+            num_intruders = graph.intruder_indices.shape[0]
+            defender_embeddings = node_embeddings[:, :num_defenders]
+            intruder_embeddings = node_embeddings[:, num_defenders : num_defenders + num_intruders]
+            point_start = num_defenders + num_intruders + 1
+            point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
+            weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_features)
+            actions = self.actor.deterministic(
+                torch.as_tensor(norm_obs, dtype=torch.float32),
+                defender_embeddings[0],
+                context[0],
+            ).cpu().numpy()
+        diagnostics = {
+            "assignment_entropy": assignment_entropy(weights.cpu().numpy()),
+            "mean_interception_time_advantage": mean_interception_time_advantage(graph.interception_time_advantage),
+            "graph_attention_sparsity": graph_attention_sparsity(attention.cpu().numpy()),
+        }
+        return np.clip(actions, -1.0, 1.0).astype(np.float32), diagnostics
 
 
 def evaluate_episode(
@@ -59,8 +166,9 @@ def evaluate_episode(
     metadata: dict[str, float | int | str],
 ) -> dict[str, float]:
     rng = np.random.default_rng(seed)
-    _, info = env.reset(seed=seed)
+    observations, info = env.reset(seed=seed)
     initialize_scenario_state(env, scenario_name, rng)
+    observations = env._observations()
     info = env._infos()
     initial_info = info[env.defense_agents[0]]
     high_threat_mask = initial_info["threat_scores"] >= 0.7
@@ -76,12 +184,15 @@ def evaluate_episode(
     total_defender_distance_to_asset = 0.0
     total_blocking_flags = 0.0
     total_blocking_denominator = 0.0
+    total_assignment_entropy = 0.0
+    total_ita = 0.0
+    total_attention_sparsity = 0.0
     steps = 0
 
     for _ in range(env.config.max_steps):
         agent_info = info[env.defense_agents[0]]
-        actions = policy_action(env, policy, agent_info)
-        _, _, terminations, truncations, info = env.step(actions)
+        actions, diagnostics = policy_action(env, policy, agent_info, observations)
+        observations, _, terminations, truncations, info = env.step(actions)
         agent_info = info[env.defense_agents[0]]
         intercepted = np.asarray(agent_info["intercepted"], dtype=bool)
         breached = np.asarray(agent_info["breached"], dtype=bool)
@@ -107,6 +218,9 @@ def evaluate_episode(
         )
         total_blocking_flags += float(np.sum(agent_info.get("blocking_flags", np.zeros(env.config.num_defenders))))
         total_blocking_denominator += float(env.config.num_defenders)
+        total_assignment_entropy += diagnostics.get("assignment_entropy", 0.0)
+        total_ita += diagnostics.get("mean_interception_time_advantage", 0.0)
+        total_attention_sparsity += diagnostics.get("graph_attention_sparsity", 0.0)
         steps += 1
         if terminations["__all__"] or truncations["__all__"]:
             break
@@ -130,11 +244,21 @@ def evaluate_episode(
         "average_intercept_distance_to_asset": float(np.mean(intercept_distances_to_asset)) if intercept_distances_to_asset else float("nan"),
         "average_intercept_time_to_asset": float(np.mean(intercept_time_to_asset)) if intercept_time_to_asset else float("nan"),
         "blocking_success_rate": float(total_blocking_flags / max(total_blocking_denominator, 1.0)),
+        "assignment_entropy": float(total_assignment_entropy / max(steps, 1)),
+        "mean_interception_time_advantage": float(total_ita / max(steps, 1)),
+        "graph_attention_sparsity": float(total_attention_sparsity / max(steps, 1)),
         "steps": float(steps),
     }
 
 
-def policy_action(env: CounterUAVEnv, policy: Policy, info: dict[str, Any]) -> np.ndarray:
+def policy_action(
+    env: CounterUAVEnv,
+    policy: Policy,
+    info: dict[str, Any],
+    observations: dict[str, np.ndarray],
+) -> tuple[np.ndarray, dict[str, float]]:
+    if isinstance(policy, (MAPPOEvaluationPolicy, IPGAEvaluationPolicy)):
+        return policy.act(observations, env.defense_agents, info)
     common = {
         "defender_positions": info["defender_positions"],
         "defender_velocities": info["defender_velocities"],
@@ -145,8 +269,8 @@ def policy_action(env: CounterUAVEnv, policy: Policy, info: dict[str, Any]) -> n
         "world_size": env.config.world_size,
     }
     if isinstance(policy, HungarianAssignmentPolicy):
-        return policy.act(intruder_velocities=info["intruder_velocities"], **common)
-    return policy.act(**common)
+        return policy.act(intruder_velocities=info["intruder_velocities"], **common), {}
+    return policy.act(**common), {}
 
 
 def communication_cost(topology: np.ndarray, metadata: dict[str, float | int | str]) -> float:
@@ -200,6 +324,38 @@ def save_evaluation_results(
         writer.writeheader()
         for idx, row in enumerate(episode_rows):
             writer.writerow({"episode": idx, **row})
+
+
+def _infer_hidden_dim(actor_state: dict[str, torch.Tensor]) -> int:
+    first_weight = actor_state.get("net.0.weight")
+    if first_weight is None:
+        return 128
+    return int(first_weight.shape[0])
+
+
+def load_extended_yaml(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    data = load_yaml(path)
+    parent = data.get("extends")
+    if not parent:
+        return data
+    parent_path = Path(parent)
+    if not parent_path.is_absolute():
+        parent_path = path.parent.parent / parent if path.parent.name == "configs" else path.parent / parent
+        if not parent_path.exists():
+            parent_path = Path.cwd() / parent
+    merged = load_extended_yaml(parent_path)
+    return deep_merge(merged, {key: value for key, value in data.items() if key != "extends"})
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 if __name__ == "__main__":

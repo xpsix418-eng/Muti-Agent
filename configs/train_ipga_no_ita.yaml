@@ -1,0 +1,12 @@
+scenario: Scenario5v5
+algorithm: IPGA-MAPPO-no-ita
+extends: configs/train_ipga_mappo_5v5.yaml
+training:
+  total_env_steps: 2000000
+ipga:
+  use_graph: true
+  use_assignment_gate: true
+  use_ita_features: false
+  use_assignment_loss: true
+logging:
+  log_dir: experiments/results/ipga_ablation/no_ita

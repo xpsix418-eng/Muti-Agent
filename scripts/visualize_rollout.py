@@ -17,6 +17,10 @@ from matplotlib.patches import Circle
 
 import _bootstrap  # noqa: F401
 from algorithms.hungarian_assignment import HungarianAssignmentPolicy
+from algorithms.ipga_mappo.actor import IPGAActor
+from algorithms.ipga_mappo.graph_encoder import InterceptionGraphEncoder
+from algorithms.ipga_mappo.interception_graph import InterceptionGraphBuilder
+from algorithms.ipga_mappo.soft_assignment_gate import SoftAssignmentGate
 from algorithms.mappo.actor import MLPActor
 from algorithms.mappo.utils import RunningMeanStd
 from algorithms.rule_based import RuleBasedPolicy
@@ -31,7 +35,7 @@ Policy = Any
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/env_2d.yaml")
-    parser.add_argument("--policy", choices=["rule_based", "hungarian", "mappo"], default="rule_based")
+    parser.add_argument("--policy", choices=["rule_based", "hungarian", "mappo", "ipga_mappo"], default="rule_based")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--scenario", default="ScenarioB")
     parser.add_argument("--seed", type=int, default=42)
@@ -46,8 +50,14 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     save_trajectory_png(env, rollout, output_dir / "trajectory.png")
     save_rollout_gif(env, rollout, output_dir / "rollout.gif")
+    if args.policy == "ipga_mappo":
+        save_rollout_gif(env, rollout, output_dir / "ipga_rollout.gif")
+        save_ipga_assignment_png(env, rollout, output_dir / "ipga_assignment.png")
     print(f"saved_trajectory={output_dir / 'trajectory.png'}")
     print(f"saved_gif={output_dir / 'rollout.gif'}")
+    if args.policy == "ipga_mappo":
+        print(f"saved_ipga_gif={output_dir / 'ipga_rollout.gif'}")
+        print(f"saved_ipga_assignment={output_dir / 'ipga_assignment.png'}")
 
 
 class MAPPOVisualizationPolicy:
@@ -70,11 +80,79 @@ class MAPPOVisualizationPolicy:
         return np.clip(actions, -1.0, 1.0).astype(np.float32)
 
 
+class IPGAVisualizationPolicy:
+    def __init__(self, checkpoint_path: str, env: CounterUAVEnv):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        cfg = checkpoint.get("config", {})
+        obs_dim = env.observation_spaces[env.defense_agents[0]].shape[0]
+        graph_dim = int(cfg.get("graph_hidden_dim", 128))
+        hidden_dim = int(cfg.get("hidden_dim", 128))
+        self.builder = InterceptionGraphBuilder(
+            env.config.world_size,
+            env.config.defender_max_speed,
+            env.config.intruder_max_speed,
+            float(cfg.get("prediction_horizon", 5.0)),
+        )
+        sample = self.builder.build(env._infos()[env.defense_agents[0]])
+        self.edge_index = torch.as_tensor(sample.edge_index, dtype=torch.long)
+        self.graph_encoder = InterceptionGraphEncoder(
+            sample.node_features.shape[1],
+            sample.edge_features.shape[1],
+            graph_dim,
+            int(cfg.get("num_graph_layers", 2)),
+            int(cfg.get("attention_heads", 4)),
+        )
+        self.assignment_gate = SoftAssignmentGate(graph_dim, sample.edge_features.shape[1], hidden_dim)
+        self.actor = IPGAActor(obs_dim, graph_dim, 2, hidden_dim)
+        self.graph_encoder.load_state_dict(checkpoint["graph_encoder"])
+        self.assignment_gate.load_state_dict(checkpoint["assignment_gate"])
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.graph_encoder.eval()
+        self.assignment_gate.eval()
+        self.actor.eval()
+        self.obs_rms = RunningMeanStd((obs_dim,))
+        if "obs_rms" in checkpoint:
+            self.obs_rms.load_state_dict(checkpoint["obs_rms"])
+        self.last_assignment_weights: np.ndarray | None = None
+        self.last_attention: np.ndarray | None = None
+        self.last_intercept_points: np.ndarray | None = None
+
+    def act(self, observations: dict[str, np.ndarray], agents: list[str], info: dict[str, Any]) -> np.ndarray:
+        obs = np.stack([observations[agent] for agent in agents]).astype(np.float32)
+        norm_obs = self.obs_rms.normalize(obs)
+        graph = self.builder.build(info)
+        node_features = torch.as_tensor(graph.node_features[None, :, :], dtype=torch.float32)
+        edge_features = torch.as_tensor(graph.edge_features[None, :, :], dtype=torch.float32)
+        pair_features = torch.as_tensor(graph.pair_edge_features[None, :, :, :], dtype=torch.float32)
+        with torch.no_grad():
+            node_embeddings, _, attention = self.graph_encoder(node_features, self.edge_index, edge_features)
+            num_defenders = len(agents)
+            num_intruders = graph.intruder_indices.shape[0]
+            defender_embeddings = node_embeddings[:, :num_defenders]
+            intruder_embeddings = node_embeddings[:, num_defenders : num_defenders + num_intruders]
+            point_start = num_defenders + num_intruders + 1
+            point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
+            weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_features)
+            actions = self.actor.deterministic(
+                torch.as_tensor(norm_obs, dtype=torch.float32),
+                defender_embeddings[0],
+                context[0],
+            ).cpu().numpy()
+        self.last_assignment_weights = weights[0].cpu().numpy()
+        self.last_attention = attention[0].cpu().numpy()
+        self.last_intercept_points = graph.predicted_intercept_points.copy()
+        return np.clip(actions, -1.0, 1.0).astype(np.float32)
+
+
 def build_policy(policy_name: str, env: CounterUAVEnv, checkpoint_path: str | None = None) -> Policy:
     if policy_name == "mappo":
         if checkpoint_path is None:
             raise ValueError("--policy mappo requires --checkpoint PATH")
         return MAPPOVisualizationPolicy(checkpoint_path, env)
+    if policy_name == "ipga_mappo":
+        if checkpoint_path is None:
+            raise ValueError("--policy ipga_mappo requires --checkpoint PATH")
+        return IPGAVisualizationPolicy(checkpoint_path, env)
     if policy_name == "rule_based":
         return RuleBasedPolicy()
     if policy_name == "hungarian":
@@ -99,6 +177,9 @@ def collect_rollout(
         "intruders": [],
         "threat_scores": [],
         "topology": [],
+        "predicted_intercept_points": [],
+        "assignment_weights": [],
+        "graph_attention": [],
         "intercepts": [],
         "breaches": [],
     }
@@ -111,6 +192,7 @@ def collect_rollout(
             rollout, agent_info, previous_intercepted, previous_breached
         )
         actions = policy_action(env, policy, agent_info, observations=observations)
+        append_ipga_frame(rollout, policy, agent_info)
         next_obs, _, terminations, truncations, info = env.step(actions)
         agent_info = info[env.defense_agents[0]]
         observations = next_obs
@@ -137,11 +219,36 @@ def append_frame(
     return intercepted, breached
 
 
+def append_ipga_frame(rollout: dict[str, list[Any]], policy: Policy, info: dict[str, Any]) -> None:
+    if isinstance(policy, IPGAVisualizationPolicy):
+        rollout["predicted_intercept_points"].append(
+            policy.last_intercept_points.copy()
+            if policy.last_intercept_points is not None
+            else info.get("predicted_intercept_points", np.empty((0, 2))).copy()
+        )
+        rollout["assignment_weights"].append(
+            policy.last_assignment_weights.copy()
+            if policy.last_assignment_weights is not None
+            else np.empty((0, 0), dtype=np.float32)
+        )
+        rollout["graph_attention"].append(
+            policy.last_attention.copy() if policy.last_attention is not None else np.empty(0, dtype=np.float32)
+        )
+    else:
+        rollout["predicted_intercept_points"].append(info.get("predicted_intercept_points", np.empty((0, 2))).copy())
+        rollout["assignment_weights"].append(np.empty((0, 0), dtype=np.float32))
+        rollout["graph_attention"].append(np.empty(0, dtype=np.float32))
+
+
 def policy_action(env: CounterUAVEnv, policy: Policy, info: dict[str, Any], observations: dict[str, np.ndarray] | None) -> np.ndarray:
     if isinstance(policy, MAPPOVisualizationPolicy):
         if observations is None:
             observations = env._observations()
         return policy.act(observations, env.defense_agents)
+    if isinstance(policy, IPGAVisualizationPolicy):
+        if observations is None:
+            observations = env._observations()
+        return policy.act(observations, env.defense_agents, info)
     common = {
         "defender_positions": info["defender_positions"],
         "defender_velocities": info["defender_velocities"],
@@ -218,12 +325,53 @@ def draw_frame(env: CounterUAVEnv, rollout: dict[str, list[Any]], ax: plt.Axes, 
     threats = rollout["threat_scores"][frame_idx]
     topology = rollout["topology"][frame_idx]
     draw_communication_edges(defenders, topology, ax)
+    draw_ipga_overlays(rollout, ax, frame_idx, defenders, intruders)
     ax.scatter(defenders[:, 0], defenders[:, 1], c="tab:blue", s=35, label="defenders")
     scatter = ax.scatter(intruders[:, 0], intruders[:, 1], c=threats, cmap="YlOrRd", vmin=0.0, vmax=1.0, s=45, label="intruders")
     for idx, point in enumerate(intruders):
         ax.text(point[0], point[1], f"{threats[idx]:.2f}", fontsize=6, color="black")
     if frame_idx == 0:
         plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="threat")
+
+
+def draw_ipga_overlays(
+    rollout: dict[str, list[Any]],
+    ax: plt.Axes,
+    frame_idx: int,
+    defenders: np.ndarray,
+    intruders: np.ndarray,
+) -> None:
+    if frame_idx >= len(rollout.get("predicted_intercept_points", [])):
+        return
+    points = rollout["predicted_intercept_points"][frame_idx]
+    if len(points):
+        ax.scatter(points[:, 0], points[:, 1], c="tab:purple", marker="^", s=35, alpha=0.8, label="predicted intercept")
+    weights = rollout["assignment_weights"][frame_idx]
+    if weights.size == 0:
+        return
+    segments = []
+    widths = []
+    for defender_idx in range(min(weights.shape[0], defenders.shape[0])):
+        for intruder_idx in range(min(weights.shape[1], intruders.shape[0])):
+            weight = float(weights[defender_idx, intruder_idx])
+            if weight < 0.12:
+                continue
+            target = points[intruder_idx] if len(points) > intruder_idx else intruders[intruder_idx]
+            segments.append([defenders[defender_idx], target])
+            widths.append(0.5 + 3.0 * weight)
+    if segments:
+        ax.add_collection(LineCollection(segments, colors="tab:purple", linewidths=widths, alpha=0.35))
+
+
+def save_ipga_assignment_png(env: CounterUAVEnv, rollout: dict[str, list[Any]], path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(8, 8))
+    configure_axes(env, ax)
+    frame_idx = max(0, len(rollout["defenders"]) - 1)
+    draw_frame(env, rollout, ax, frame_idx)
+    ax.set_title("IPGA soft assignment and interception points")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
 
 
 def draw_communication_edges(defender_positions: np.ndarray, topology: np.ndarray, ax: plt.Axes) -> None:

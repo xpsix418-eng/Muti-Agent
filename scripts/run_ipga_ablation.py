@@ -40,6 +40,13 @@ EXPERIMENTS = [
         "train": ["scripts/train_ipga_mappo.py", "--config", "configs/train_ipga_no_assignment_gate.yaml"],
     },
     {
+        "name": "IPGA without graph",
+        "policy": "ipga_mappo",
+        "config": "configs/train_ipga_no_graph.yaml",
+        "checkpoint": "experiments/results/ipga_ablation/no_graph/Scenario5v5/checkpoints/latest.pt",
+        "train": ["scripts/train_ipga_mappo.py", "--config", "configs/train_ipga_no_graph.yaml"],
+    },
+    {
         "name": "IPGA without ITA",
         "policy": "ipga_mappo",
         "config": "configs/train_ipga_no_ita.yaml",

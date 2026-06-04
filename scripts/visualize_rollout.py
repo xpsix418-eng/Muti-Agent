@@ -24,7 +24,7 @@ from algorithms.ipga_mappo.soft_assignment_gate import SoftAssignmentGate
 from algorithms.mappo.actor import MLPActor
 from algorithms.mappo.utils import RunningMeanStd
 from algorithms.rule_based import RuleBasedPolicy
-from envs.config import load_env_config
+from envs.config import config_from_mapping, load_env_config, load_yaml
 from envs.counter_uav_env import CounterUAVEnv
 from envs.scenarios import apply_scenario_to_config, initialize_scenario_state
 
@@ -43,7 +43,9 @@ def main() -> None:
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
 
-    env = CounterUAVEnv(apply_scenario_to_config(load_env_config(args.config), args.scenario))
+    raw_config = load_extended_yaml(args.config)
+    env_config = config_from_mapping(raw_config["env"]) if "env" in raw_config else load_env_config(args.config)
+    env = CounterUAVEnv(apply_scenario_to_config(env_config, args.scenario))
     policy = build_policy(args.policy, env, args.checkpoint)
     rollout = collect_rollout(env, policy, args.scenario, seed=args.seed, max_steps=args.max_steps)
     output_dir = Path(args.output_dir or Path("experiments") / "results" / f"{args.policy}_{args.scenario}_rollout")
@@ -113,6 +115,9 @@ class IPGAVisualizationPolicy:
         self.obs_rms = RunningMeanStd((obs_dim,))
         if "obs_rms" in checkpoint:
             self.obs_rms.load_state_dict(checkpoint["obs_rms"])
+        self.use_graph = bool(cfg.get("use_graph", True))
+        self.use_assignment_gate = bool(cfg.get("use_assignment_gate", True))
+        self.use_ita_features = bool(cfg.get("use_ita_features", True))
         self.last_assignment_weights: np.ndarray | None = None
         self.last_attention: np.ndarray | None = None
         self.last_intercept_points: np.ndarray | None = None
@@ -124,6 +129,9 @@ class IPGAVisualizationPolicy:
         node_features = torch.as_tensor(graph.node_features[None, :, :], dtype=torch.float32)
         edge_features = torch.as_tensor(graph.edge_features[None, :, :], dtype=torch.float32)
         pair_features = torch.as_tensor(graph.pair_edge_features[None, :, :, :], dtype=torch.float32)
+        if not self.use_ita_features:
+            edge_features[..., 5] = 0.0
+            pair_features[..., 5] = 0.0
         with torch.no_grad():
             node_embeddings, _, attention = self.graph_encoder(node_features, self.edge_index, edge_features)
             num_defenders = len(agents)
@@ -133,6 +141,11 @@ class IPGAVisualizationPolicy:
             point_start = num_defenders + num_intruders + 1
             point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
             weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_features)
+            if not self.use_graph:
+                defender_embeddings = torch.zeros_like(defender_embeddings)
+                context = torch.zeros_like(context)
+            elif not self.use_assignment_gate:
+                context = torch.zeros_like(context)
             actions = self.actor.deterministic(
                 torch.as_tensor(norm_obs, dtype=torch.float32),
                 defender_embeddings[0],
@@ -381,6 +394,31 @@ def draw_communication_edges(defender_positions: np.ndarray, topology: np.ndarra
         segments.append([defender_positions[row], defender_positions[col]])
     if segments:
         ax.add_collection(LineCollection(segments, colors="tab:cyan", linewidths=0.6, alpha=0.35))
+
+
+def load_extended_yaml(path: str | Path) -> dict[str, Any]:
+    path = Path(path)
+    data = load_yaml(path)
+    parent = data.get("extends")
+    if not parent:
+        return data
+    parent_path = Path(parent)
+    if not parent_path.is_absolute():
+        parent_path = path.parent.parent / parent if path.parent.name == "configs" else path.parent / parent
+        if not parent_path.exists():
+            parent_path = Path.cwd() / parent
+    merged = load_extended_yaml(parent_path)
+    return deep_merge(merged, {key: value for key, value in data.items() if key != "extends"})
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
+
 import _bootstrap  # noqa: F401
 from algorithms.ipga_mappo.trainer import IPGAMAPPOConfig, IPGAMAPPOTrainer
 from envs.config import config_from_mapping, load_yaml
@@ -16,14 +18,18 @@ def main() -> None:
     parser.add_argument("--scenario", default=None)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--torch-threads", type=int, default=None)
     args = parser.parse_args()
+    if args.torch_threads is not None:
+        torch.set_num_threads(max(1, args.torch_threads))
 
     raw_config = load_extended_yaml(args.config)
     env_config = config_from_mapping(raw_config.get("env", raw_config))
     scenario = args.scenario or raw_config.get("scenario", "Scenario5v5")
     env = CounterUAVEnv(apply_scenario_to_config(env_config, scenario))
     trainer_config = build_trainer_config(raw_config, scenario, args.total_steps)
-    trainer = IPGAMAPPOTrainer(env, trainer_config)
+    trainer = IPGAMAPPOTrainer(env, trainer_config, device=args.device)
     if args.checkpoint:
         trainer.load_checkpoint(args.checkpoint)
     trainer.train()

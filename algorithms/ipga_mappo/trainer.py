@@ -64,7 +64,6 @@ class IPGAMAPPOConfig:
 
 @dataclass
 class GraphMiniBatch:
-    indices: np.ndarray
     observations: torch.Tensor
     global_states: torch.Tensor
     actions: torch.Tensor
@@ -72,7 +71,6 @@ class GraphMiniBatch:
     advantages: torch.Tensor
     returns: torch.Tensor
     old_values: torch.Tensor
-    agent_indices: torch.Tensor
     node_features: torch.Tensor
     edge_features: torch.Tensor
     pair_edge_features: torch.Tensor
@@ -121,33 +119,21 @@ class IPGAGraphRolloutBuffer(RolloutBuffer):
         self.heuristic_assignments[pos] = graph_data.heuristic_assignments
 
     def graph_mini_batches(self, batch_size: int, shuffle: bool = True) -> Iterator[GraphMiniBatch]:
-        total = self.position * self.num_agents
-        indices = np.arange(total)
+        step_batch_size = max(1, batch_size // self.num_agents)
+        indices = np.arange(self.position)
         if shuffle:
             np.random.shuffle(indices)
-        step_indices = indices // self.num_agents
-        agent_indices = indices % self.num_agents
-        observations = self.observations[: self.position].reshape(total, self.obs_dim)
-        global_states = self.global_states[: self.position].reshape(total, self.state_dim)
-        actions = self.actions[: self.position].reshape(total, self.action_dim)
-        log_probs = self.log_probs[: self.position].reshape(total)
-        advantages = self.advantages[: self.position].reshape(total)
-        returns = self.returns[: self.position].reshape(total)
-        values = self.values[: self.position].reshape(total)
-        for start in range(0, total, batch_size):
-            batch_idx = indices[start : start + batch_size]
-            steps = step_indices[start : start + batch_size]
-            agents = agent_indices[start : start + batch_size]
+        for start in range(0, self.position, step_batch_size):
+            steps = indices[start : start + step_batch_size]
+            batch_steps = len(steps)
             yield GraphMiniBatch(
-                indices=batch_idx,
-                observations=self._tensor(observations[batch_idx]),
-                global_states=self._tensor(global_states[batch_idx]),
-                actions=self._tensor(actions[batch_idx]),
-                old_log_probs=self._tensor(log_probs[batch_idx]),
-                advantages=self._tensor(advantages[batch_idx]),
-                returns=self._tensor(returns[batch_idx]),
-                old_values=self._tensor(values[batch_idx]),
-                agent_indices=torch.as_tensor(agents, dtype=torch.long, device=self.device),
+                observations=self._tensor(self.observations[steps].reshape(batch_steps * self.num_agents, self.obs_dim)),
+                global_states=self._tensor(self.global_states[steps].reshape(batch_steps * self.num_agents, self.state_dim)),
+                actions=self._tensor(self.actions[steps].reshape(batch_steps * self.num_agents, self.action_dim)),
+                old_log_probs=self._tensor(self.log_probs[steps].reshape(batch_steps * self.num_agents)),
+                advantages=self._tensor(self.advantages[steps].reshape(batch_steps * self.num_agents)),
+                returns=self._tensor(self.returns[steps].reshape(batch_steps * self.num_agents)),
+                old_values=self._tensor(self.values[steps].reshape(batch_steps * self.num_agents)),
                 node_features=self._tensor(self.node_features[steps]),
                 edge_features=self._tensor(self.edge_features[steps]),
                 pair_edge_features=self._tensor(self.pair_edge_features[steps]),
@@ -243,8 +229,17 @@ class IPGAMAPPOTrainer:
                 defender_embeddings, pooled, context, weights, attention = self._graph_forward(*graph_tensors)
                 obs_tensor = torch.as_tensor(norm_obs, dtype=torch.float32, device=self.device)
                 state_tensor = torch.as_tensor(norm_states, dtype=torch.float32, device=self.device)
-                action_tensor, log_prob_tensor, _ = self.actor.sample(obs_tensor, defender_embeddings[0], context[0])
-                value_tensor = self.critic(state_tensor, pooled.expand(self.num_agents, -1))
+                actor_defender_embeddings = defender_embeddings[0]
+                actor_context = context[0]
+                critic_pooled = pooled
+                if not self.config.use_graph:
+                    actor_defender_embeddings = torch.zeros_like(actor_defender_embeddings)
+                    actor_context = torch.zeros_like(actor_context)
+                    critic_pooled = torch.zeros_like(critic_pooled)
+                elif not self.config.use_assignment_gate:
+                    actor_context = torch.zeros_like(actor_context)
+                action_tensor, log_prob_tensor, _ = self.actor.sample(obs_tensor, actor_defender_embeddings, actor_context)
+                value_tensor = self.critic(state_tensor, critic_pooled.expand(self.num_agents, -1))
             actions = action_tensor.cpu().numpy()
             values = value_tensor.cpu().numpy()
             rewards, done, next_info = self._env_step(actions)
@@ -328,11 +323,13 @@ class IPGAMAPPOTrainer:
                     batch.edge_features,
                     batch.pair_edge_features,
                 )
-                row_indices = torch.arange(batch.agent_indices.shape[0], device=self.device)
-                selected_defenders = defender_embeddings[row_indices, batch.agent_indices]
-                selected_context = context[row_indices, batch.agent_indices]
+                batch_steps = defender_embeddings.shape[0]
+                selected_defenders = defender_embeddings.reshape(batch_steps * self.num_agents, -1)
+                selected_context = context.reshape(batch_steps * self.num_agents, -1)
+                pooled = pooled[:, None, :].expand(batch_steps, self.num_agents, -1).reshape(batch_steps * self.num_agents, -1)
                 if not self.config.use_graph:
                     selected_defenders = torch.zeros_like(selected_defenders)
+                    selected_context = torch.zeros_like(selected_context)
                     pooled = torch.zeros_like(pooled)
                 if not self.config.use_assignment_gate:
                     selected_context = torch.zeros_like(selected_context)
@@ -389,6 +386,18 @@ class IPGAMAPPOTrainer:
                 )
             metrics = {**self.collect_rollouts(), **self.update()}
             self._log_train_metrics(metrics)
+            if update_idx == 0 or (update_idx + 1) % 10 == 0 or update_idx + 1 == updates:
+                print(
+                    "update="
+                    f"{update_idx + 1}/{updates} "
+                    f"step={self.global_step} "
+                    f"intercept_rate={metrics.get('intercept_rate', 0.0):.3f} "
+                    f"blocking_success_rate={metrics.get('blocking_success_rate', 0.0):.3f} "
+                    f"collision_rate={metrics.get('collision_rate', 0.0):.3f} "
+                    f"assignment_loss={metrics.get('assignment_loss', 0.0):.4f} "
+                    f"lr={metrics.get('learning_rate', 0.0):.6f}",
+                    flush=True,
+                )
         self.save_checkpoint(Path(self.config.checkpoint_dir) / "latest.pt")
 
     def save_checkpoint(self, path: str | Path) -> None:

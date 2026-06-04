@@ -35,6 +35,7 @@ class IPGAMAPPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     entropy_coef: float = 0.008
+    entropy_coef_end: float | None = None
     value_coef: float = 0.5
     learning_rate: float = 3e-4
     min_learning_rate: float = 3e-5
@@ -55,6 +56,8 @@ class IPGAMAPPOConfig:
     assignment_loss_end: float = 0.0
     assignment_loss_decay_steps: int = 1_000_000
     use_graph: bool = True
+    graph_type: str = "ipg"
+    use_interception_point_nodes: bool = True
     use_assignment_gate: bool = True
     use_ita_features: bool = True
     use_assignment_loss: bool = True
@@ -160,6 +163,9 @@ class IPGAMAPPOTrainer:
             env.config.defender_max_speed,
             env.config.intruder_max_speed,
             config.prediction_horizon,
+            graph_type=config.graph_type,
+            include_interception_point_nodes=config.use_interception_point_nodes,
+            include_ita_edge_feature=config.use_ita_features,
         )
         sample_graph = self.graph_builder.build(info[self.agents[0]])
         self.edge_index = torch.as_tensor(sample_graph.edge_index, dtype=torch.long, device=self.device)
@@ -208,6 +214,7 @@ class IPGAMAPPOTrainer:
         episode_rewards: list[float] = []
         intercept_rates: list[float] = []
         breach_rates: list[float] = []
+        success_rates: list[float] = []
         collision_rates: list[float] = []
         blocking_rates: list[float] = []
         energy_costs: list[float] = []
@@ -265,6 +272,7 @@ class IPGAMAPPOTrainer:
                     "episode_reward": float(reward_sum),
                     "intercept_rate": float(np.mean(intercepted)),
                     "breach_rate": float(np.mean(breached)),
+                    "success_rate": float(np.all(intercepted) and not np.any(breached)),
                     "collision_rate": float(collision_sum / max(episode_steps, 1)),
                     "blocking_success_rate": float(blocking_sum / max(blocking_denominator, 1.0)),
                     "average_energy_cost": float(energy_sum / max(episode_steps, 1)),
@@ -273,6 +281,7 @@ class IPGAMAPPOTrainer:
                 episode_rewards.append(metrics["episode_reward"])
                 intercept_rates.append(metrics["intercept_rate"])
                 breach_rates.append(metrics["breach_rate"])
+                success_rates.append(metrics["success_rate"])
                 collision_rates.append(metrics["collision_rate"])
                 blocking_rates.append(metrics["blocking_success_rate"])
                 energy_costs.append(metrics["average_energy_cost"])
@@ -293,6 +302,7 @@ class IPGAMAPPOTrainer:
             "episode_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
             "intercept_rate": float(np.mean(intercept_rates)) if intercept_rates else 0.0,
             "breach_rate": float(np.mean(breach_rates)) if breach_rates else 0.0,
+            "success_rate": float(np.mean(success_rates)) if success_rates else 0.0,
             "collision_rate": float(np.mean(collision_rates)) if collision_rates else 0.0,
             "blocking_success_rate": float(np.mean(blocking_rates)) if blocking_rates else 0.0,
             "average_energy_cost": float(np.mean(energy_costs)) if energy_costs else 0.0,
@@ -375,6 +385,7 @@ class IPGAMAPPOTrainer:
 
     def train(self) -> None:
         updates = max(1, self.config.total_steps // (self.config.rollout_length * self.num_agents))
+        entropy_coef_start = float(self.config.entropy_coef)
         for update_idx in range(updates):
             progress_remaining = 1.0 - update_idx / max(updates, 1)
             if self.config.lr_schedule:
@@ -383,6 +394,11 @@ class IPGAMAPPOTrainer:
                     self.config.learning_rate,
                     progress_remaining,
                     self.config.min_learning_rate,
+                )
+            if self.config.entropy_coef_end is not None:
+                self.config.entropy_coef = float(
+                    self.config.entropy_coef_end
+                    + (entropy_coef_start - self.config.entropy_coef_end) * progress_remaining
                 )
             metrics = {**self.collect_rollouts(), **self.update()}
             self._log_train_metrics(metrics)
@@ -481,8 +497,21 @@ class IPGAMAPPOTrainer:
         defender_embeddings = node_embeddings[:, :num_defenders]
         intruder_embeddings = node_embeddings[:, num_defenders : num_defenders + num_intruders]
         point_start = num_defenders + num_intruders + 1
-        point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
-        weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_edge_features)
+        if self.config.use_interception_point_nodes:
+            point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
+        else:
+            point_embeddings = torch.zeros_like(intruder_embeddings)
+        if self.config.use_assignment_gate:
+            weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_edge_features)
+        else:
+            weights = torch.zeros(
+                defender_embeddings.shape[0],
+                num_defenders,
+                num_intruders,
+                dtype=defender_embeddings.dtype,
+                device=defender_embeddings.device,
+            )
+            context = torch.zeros_like(defender_embeddings)
         return defender_embeddings, pooled, context, weights, attention
 
     def _log_episode_metrics(self, metrics: dict[str, float]) -> None:

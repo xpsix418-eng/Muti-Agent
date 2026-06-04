@@ -1,0 +1,25 @@
+scenario: Scenario5v5
+algorithm: IPG-MAPPO + Assignment Gate
+extends: configs/final_5v5_ipg_mappo.yaml
+method:
+  use_dense_reward: true
+  use_predictive_reward: true
+  use_soft_assignment: false
+  use_graph_encoder: true
+  graph_type: ipg
+  use_interception_point_nodes: true
+  use_ita_edge_feature: true
+  use_assignment_gate: true
+  use_assignment_auxiliary_loss: true
+ipga:
+  graph_type: ipg
+  use_graph: true
+  use_interception_point_nodes: true
+  use_ita_features: true
+  use_assignment_gate: true
+  use_assignment_loss: true
+  assignment_loss_start: 0.04
+  assignment_loss_end: 0.0
+  assignment_loss_decay_steps: 1000000
+logging:
+  log_dir: experiments/results/final_5v5/ipg_with_assignment_gate

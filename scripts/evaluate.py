@@ -123,6 +123,9 @@ class IPGAEvaluationPolicy:
             env.config.defender_max_speed,
             env.config.intruder_max_speed,
             float(cfg.get("prediction_horizon", 5.0)),
+            graph_type=str(cfg.get("graph_type", "ipg")),
+            include_interception_point_nodes=bool(cfg.get("use_interception_point_nodes", True)),
+            include_ita_edge_feature=bool(cfg.get("use_ita_features", True)),
         )
         sample = self.builder.build(env._infos()[env.defense_agents[0]])
         self.edge_index = torch.as_tensor(sample.edge_index, dtype=torch.long)
@@ -148,6 +151,7 @@ class IPGAEvaluationPolicy:
         if "obs_rms" in checkpoint:
             self.obs_rms.load_state_dict(checkpoint["obs_rms"])
         self.use_graph = bool(cfg.get("use_graph", True))
+        self.use_interception_point_nodes = bool(cfg.get("use_interception_point_nodes", True))
         self.use_assignment_gate = bool(cfg.get("use_assignment_gate", True))
         self.use_ita_features = bool(cfg.get("use_ita_features", True))
 
@@ -174,8 +178,15 @@ class IPGAEvaluationPolicy:
             defender_embeddings = node_embeddings[:, :num_defenders]
             intruder_embeddings = node_embeddings[:, num_defenders : num_defenders + num_intruders]
             point_start = num_defenders + num_intruders + 1
-            point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
-            weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_features)
+            if self.use_interception_point_nodes:
+                point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
+            else:
+                point_embeddings = torch.zeros_like(intruder_embeddings)
+            if self.use_assignment_gate:
+                weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_features)
+            else:
+                weights = torch.zeros(1, num_defenders, num_intruders)
+                context = torch.zeros_like(defender_embeddings)
             if not self.use_graph:
                 defender_embeddings = torch.zeros_like(defender_embeddings)
                 context = torch.zeros_like(context)
@@ -269,13 +280,17 @@ def evaluate_episode(
     high_threat_denominator = max(int(np.sum(high_threat_mask)), 1)
     valid_intercept_times = intercept_times[~np.isnan(intercept_times)]
     success = float(np.all(intercepted) and not np.any(breached))
+    average_collisions_per_step = float(total_collisions / max(steps, 1))
     return {
         "intercept_rate": float(np.mean(intercepted)),
         "breach_rate": float(np.mean(breached)),
         "high_threat_intercept_rate": float(np.sum(intercepted & high_threat_mask) / high_threat_denominator),
         "average_intercept_time": float(np.mean(valid_intercept_times)) if len(valid_intercept_times) else float(env.config.max_steps),
         "average_energy_cost": float(total_energy / max(steps, 1)),
-        "collision_rate": float(total_collisions / max(steps, 1)),
+        "collision_rate": average_collisions_per_step,
+        "average_collisions_per_step": average_collisions_per_step,
+        "average_collisions_per_episode": float(total_collisions),
+        "collision_episode_rate": float(total_collisions > 0),
         "communication_cost": float(total_communication_links / max(steps, 1)),
         "success_rate": success,
         "average_defender_distance_to_asset": float(total_defender_distance_to_asset / max(steps, 1)),

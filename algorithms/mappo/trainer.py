@@ -25,6 +25,7 @@ class MAPPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     entropy_coef: float = 0.01
+    entropy_coef_end: float | None = None
     value_coef: float = 0.5
     learning_rate: float = 3e-4
     min_learning_rate: float = 0.0
@@ -92,6 +93,7 @@ class MAPPOTrainer:
         energy_costs: list[float] = []
         intercept_rates: list[float] = []
         breach_rates: list[float] = []
+        success_rates: list[float] = []
         blocking_rates: list[float] = []
         current_episode_reward = 0.0
         current_episode_energy = 0.0
@@ -148,6 +150,7 @@ class MAPPOTrainer:
                 collision_counts.append(metrics["collision_rate"])
                 intercept_rates.append(metrics["intercept_rate"])
                 breach_rates.append(metrics["breach_rate"])
+                success_rates.append(metrics["success_rate"])
                 blocking_rates.append(metrics["blocking_success_rate"])
                 self._log_episode_metrics(metrics)
                 self.current_obs, self.current_info = self.env.reset(seed=self.config.seed + self.episode_count + 1)
@@ -168,6 +171,7 @@ class MAPPOTrainer:
             "episode_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
             "intercept_rate": float(np.mean(intercept_rates)) if intercept_rates else 0.0,
             "breach_rate": float(np.mean(breach_rates)) if breach_rates else 0.0,
+            "success_rate": float(np.mean(success_rates)) if success_rates else 0.0,
             "collision_rate": float(np.mean(collision_counts)) if collision_counts else 0.0,
             "average_energy_cost": float(np.mean(energy_costs)) if energy_costs else 0.0,
             "blocking_success_rate": float(np.mean(blocking_rates)) if blocking_rates else 0.0,
@@ -221,6 +225,7 @@ class MAPPOTrainer:
 
     def train(self) -> None:
         updates = max(1, self.config.total_steps // (self.config.rollout_length * self.num_agents))
+        entropy_coef_start = float(self.config.entropy_coef)
         for update_idx in range(updates):
             progress_remaining = 1.0 - update_idx / max(updates, 1)
             if self.config.lr_schedule:
@@ -229,6 +234,11 @@ class MAPPOTrainer:
                     self.config.learning_rate,
                     progress_remaining,
                     self.config.min_learning_rate,
+                )
+            if self.config.entropy_coef_end is not None:
+                self.config.entropy_coef = float(
+                    self.config.entropy_coef_end
+                    + (entropy_coef_start - self.config.entropy_coef_end) * progress_remaining
                 )
             rollout_metrics = self.collect_rollouts()
             update_metrics = self.update()
@@ -294,6 +304,7 @@ class MAPPOTrainer:
             "episode_reward": float(reward),
             "intercept_rate": float(np.mean(intercepted)),
             "breach_rate": float(np.mean(breached)),
+            "success_rate": float(np.all(intercepted) and not np.any(breached)),
             "collision_rate": float(collisions / max(steps, 1)),
             "average_energy_cost": float(energy / max(steps, 1)),
             "blocking_success_rate": float(blocking / max(blocking_denominator, 1.0)),

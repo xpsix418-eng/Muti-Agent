@@ -1,0 +1,22 @@
+scenario: Scenario5v5
+algorithm: SA-PMAPPO
+extends: configs/final_5v5_pi_mappo.yaml
+method:
+  use_dense_reward: true
+  use_predictive_reward: true
+  use_soft_assignment: true
+  use_graph_encoder: false
+  graph_type: none
+  use_interception_point_nodes: false
+  use_ita_edge_feature: false
+  use_assignment_gate: false
+  use_assignment_auxiliary_loss: false
+logging:
+  log_dir: experiments/results/final_5v5/sa_pmappo
+env:
+  assignment_weight_start: 0.04
+  assignment_weight_end: 0.0
+  assignment_decay_steps: 1000000
+  assignment_update_interval: 10
+  reward:
+    assignment_guidance: 1.0

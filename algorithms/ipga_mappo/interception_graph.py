@@ -33,11 +33,17 @@ class InterceptionGraphBuilder:
         defender_max_speed: float,
         intruder_max_speed: float,
         prediction_horizon: float = 5.0,
+        graph_type: str = "ipg",
+        include_interception_point_nodes: bool = True,
+        include_ita_edge_feature: bool = True,
     ):
         self.world_size = float(world_size)
         self.defender_max_speed = float(defender_max_speed)
         self.intruder_max_speed = float(intruder_max_speed)
         self.prediction_horizon = float(prediction_horizon)
+        self.graph_type = graph_type
+        self.include_interception_point_nodes = include_interception_point_nodes
+        self.include_ita_edge_feature = include_ita_edge_feature
 
     def build(self, info: dict[str, Any]) -> InterceptionGraph:
         defenders = np.asarray(info["defender_positions"], dtype=np.float32)
@@ -74,7 +80,10 @@ class InterceptionGraphBuilder:
         defender_indices = np.arange(num_defenders, dtype=np.int64)
         intruder_indices = np.arange(num_defenders, num_defenders + num_intruders, dtype=np.int64)
         asset_index = num_defenders + num_intruders
-        point_indices = np.arange(asset_index + 1, asset_index + 1 + num_intruders, dtype=np.int64)
+        if self.include_interception_point_nodes:
+            point_indices = np.arange(asset_index + 1, asset_index + 1 + num_intruders, dtype=np.int64)
+        else:
+            point_indices = np.empty(0, dtype=np.int64)
 
         edges: list[tuple[int, int]] = []
         features: list[np.ndarray] = []
@@ -111,6 +120,7 @@ class InterceptionGraphBuilder:
                     threat_scores[intruder_idx],
                     comm,
                     df_pos,
+                    src_velocity=defender_velocities[defender_idx],
                     intercept_point=ip_pos,
                 )
                 edges.append((defender_indices[defender_idx], intruder_indices[intruder_idx]))
@@ -118,19 +128,21 @@ class InterceptionGraphBuilder:
                 pair_edge_features[defender_idx, intruder_idx] = edge
                 ita[defender_idx, intruder_idx] = edge[5]
 
-                ip_edge = self._edge_feature(
-                    df_pos,
-                    ip_pos,
-                    np.zeros(2, dtype=np.float32),
-                    asset,
-                    threat_scores[intruder_idx],
-                    comm,
-                    df_pos,
-                    intruder_pos=it_pos,
-                    intruder_vel=intruder_velocities[intruder_idx],
-                )
-                edges.append((defender_indices[defender_idx], point_indices[intruder_idx]))
-                features.append(ip_edge)
+                if self.include_interception_point_nodes:
+                    ip_edge = self._edge_feature(
+                        df_pos,
+                        ip_pos,
+                        np.zeros(2, dtype=np.float32),
+                        asset,
+                        threat_scores[intruder_idx],
+                        comm,
+                        df_pos,
+                        src_velocity=defender_velocities[defender_idx],
+                        intruder_pos=it_pos,
+                        intruder_vel=intruder_velocities[intruder_idx],
+                    )
+                    edges.append((defender_indices[defender_idx], point_indices[intruder_idx]))
+                    features.append(ip_edge)
 
         for intruder_idx in range(num_intruders):
             edges.append((intruder_indices[intruder_idx], asset_index))
@@ -145,18 +157,19 @@ class InterceptionGraphBuilder:
                     intruders[intruder_idx],
                 )
             )
-            edges.append((intruder_indices[intruder_idx], point_indices[intruder_idx]))
-            features.append(
-                self._edge_feature(
-                    intruders[intruder_idx],
-                    predicted_points[intruder_idx],
-                    intruder_velocities[intruder_idx],
-                    asset,
-                    threat_scores[intruder_idx],
-                    1.0,
-                    intruders[intruder_idx],
+            if self.include_interception_point_nodes:
+                edges.append((intruder_indices[intruder_idx], point_indices[intruder_idx]))
+                features.append(
+                    self._edge_feature(
+                        intruders[intruder_idx],
+                        predicted_points[intruder_idx],
+                        intruder_velocities[intruder_idx],
+                        asset,
+                        threat_scores[intruder_idx],
+                        1.0,
+                        intruders[intruder_idx],
+                    )
                 )
-            )
 
         edge_index = np.asarray(edges, dtype=np.int64).T
         edge_features = np.stack(features).astype(np.float32)
@@ -211,17 +224,18 @@ class InterceptionGraphBuilder:
                 )
             )
         rows.append(self._node_row(2, asset, np.zeros(2, dtype=np.float32), 1.0, 1.0, 1.0))
-        for idx, pos in enumerate(predicted_points):
-            rows.append(
-                self._node_row(
-                    node_type=3,
-                    position=pos,
-                    velocity=np.zeros(2, dtype=np.float32),
-                    threat=float(threat_scores[idx]),
-                    active=float(active[idx]),
-                    comm=1.0,
+        if self.include_interception_point_nodes:
+            for idx, pos in enumerate(predicted_points):
+                rows.append(
+                    self._node_row(
+                        node_type=3,
+                        position=pos,
+                        velocity=np.zeros(2, dtype=np.float32),
+                        threat=float(threat_scores[idx]),
+                        active=float(active[idx]),
+                        comm=1.0,
+                    )
                 )
-            )
         return np.stack(rows).astype(np.float32)
 
     def _node_row(
@@ -254,6 +268,7 @@ class InterceptionGraphBuilder:
         threat_score: float,
         communication_available: float,
         defender_pos: np.ndarray,
+        src_velocity: np.ndarray | None = None,
         intercept_point: np.ndarray | None = None,
         intruder_pos: np.ndarray | None = None,
         intruder_vel: np.ndarray | None = None,
@@ -264,10 +279,30 @@ class InterceptionGraphBuilder:
         target_pos = dst if intruder_pos is None else intruder_pos
         target_vel = dst_velocity if intruder_vel is None else intruder_vel
         to_asset = asset - target_pos
-        time_to_asset = float(np.linalg.norm(to_asset) / max(np.linalg.norm(target_vel), 1e-6))
+        target_speed = float(np.linalg.norm(target_vel))
+        if target_speed < 1e-6:
+            target_speed = self.intruder_max_speed
+        time_to_asset = float(np.linalg.norm(to_asset) / max(target_speed, 1e-6))
         ip = dst if intercept_point is None else intercept_point
         time_to_intercept = float(np.linalg.norm(ip - defender_pos) / max(self.defender_max_speed, 1e-6))
         ita = time_to_asset - time_to_intercept
+        if self.graph_type == "vanilla":
+            source_velocity = np.zeros(2, dtype=np.float32) if src_velocity is None else src_velocity
+            rel_velocity = (dst_velocity - source_velocity) / max(max(self.defender_max_speed, self.intruder_max_speed), 1e-6)
+            return np.asarray(
+                [
+                    distance / max(self.world_size, 1e-6),
+                    direction[0],
+                    direction[1],
+                    rel_velocity[0],
+                    rel_velocity[1],
+                    threat_score,
+                    communication_available,
+                ],
+                dtype=np.float32,
+            )
+        if not self.include_ita_edge_feature:
+            ita = 0.0
         return np.asarray(
             [
                 distance / max(self.world_size, 1e-6),

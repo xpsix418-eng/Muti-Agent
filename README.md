@@ -68,7 +68,54 @@ IPG-MAPPO current main method:
 python scripts/train_ipga_mappo.py --config configs/train_ipg_mappo_5v5.yaml
 ```
 
-`IPG-MAPPO` is the current tentative final method. It keeps the Interception Prediction Graph, interception-point nodes, Interception-Time Advantage edge feature, graph encoder, and MAPPO backbone. `IPG-MAPPO + Assignment Gate` is treated as an ablation unless the assignment gate is repaired and consistently outperforms IPG-MAPPO.
+`IPG-MAPPO` is the current final candidate method. It keeps the Interception Prediction Graph, interception-point nodes, Interception-Time Advantage edge feature, graph encoder, and MAPPO backbone. `IPG-MAPPO + Assignment Gate` is not the main method; it is retained as a negative ablation unless the assignment gate is repaired and consistently outperforms IPG-MAPPO.
+
+Vanilla GNN-MAPPO is the ordinary graph-network baseline. It contains defender, intruder, and asset nodes, but it does not contain interception-point nodes or ITA edge features. This baseline is used to show that IPG-MAPPO gains are not merely from adding a graph encoder. The core difference between IPG-MAPPO and Vanilla GNN-MAPPO is the interception prediction graph: predicted interception-point nodes plus the Interception-Time Advantage edge feature.
+
+Final 5v5 smoke test:
+
+```bash
+python scripts/run_final_5v5_experiments.py \
+  --methods vanilla_gnn_mappo ipg_mappo \
+  --seeds 1 \
+  --total_env_steps 10000 \
+  --eval_episodes 5 \
+  --results_dir experiments/results/smoke_test
+```
+
+Final 5v5 experiments:
+
+```bash
+python scripts/run_final_5v5_experiments.py \
+  --methods mappo dense_mappo pi_mappo sa_pmappo vanilla_gnn_mappo ipg_mappo ipg_no_ita ipg_no_graph ipg_with_assignment_gate \
+  --seeds 1 2 3 4 5 \
+  --total_env_steps 5000000 \
+  --eval_episodes 100 \
+  --results_dir experiments/results/final_5v5
+```
+
+Summarize final results:
+
+```bash
+python scripts/summarize_final_5v5_results.py \
+  --results_dir experiments/results/final_5v5
+```
+
+Plot final training curves:
+
+```bash
+python scripts/plot_final_training_curves.py \
+  --results_dir experiments/results/final_5v5
+```
+
+Visualize final rollouts:
+
+```bash
+python scripts/visualize_final_rollouts.py \
+  --methods mappo sa_pmappo vanilla_gnn_mappo ipg_mappo ipg_with_assignment_gate \
+  --seed 1 \
+  --results_dir experiments/results/final_5v5
+```
 
 Strict validation:
 
@@ -124,7 +171,8 @@ The default output directory is `experiments/results/{policy}_{scenario}_rollout
 
 - `intercept_rate = intercepted_intruders / total_intruders`; each intruder is counted once per episode.
 - `success_rate = 1` only if all intruders are intercepted and no breach occurs in the episode.
-- `collision_rate` is reported per episode step.
+- `collision_rate` is kept as the per-step collision rate for backward compatibility.
+- `average_collisions_per_step`, `average_collisions_per_episode`, and `collision_episode_rate` are reported separately in final evaluations.
 
 ## Safety Boundary
 

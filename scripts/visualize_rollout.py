@@ -94,6 +94,9 @@ class IPGAVisualizationPolicy:
             env.config.defender_max_speed,
             env.config.intruder_max_speed,
             float(cfg.get("prediction_horizon", 5.0)),
+            graph_type=str(cfg.get("graph_type", "ipg")),
+            include_interception_point_nodes=bool(cfg.get("use_interception_point_nodes", True)),
+            include_ita_edge_feature=bool(cfg.get("use_ita_features", True)),
         )
         sample = self.builder.build(env._infos()[env.defense_agents[0]])
         self.edge_index = torch.as_tensor(sample.edge_index, dtype=torch.long)
@@ -116,6 +119,7 @@ class IPGAVisualizationPolicy:
         if "obs_rms" in checkpoint:
             self.obs_rms.load_state_dict(checkpoint["obs_rms"])
         self.use_graph = bool(cfg.get("use_graph", True))
+        self.use_interception_point_nodes = bool(cfg.get("use_interception_point_nodes", True))
         self.use_assignment_gate = bool(cfg.get("use_assignment_gate", True))
         self.use_ita_features = bool(cfg.get("use_ita_features", True))
         self.last_assignment_weights: np.ndarray | None = None
@@ -139,8 +143,15 @@ class IPGAVisualizationPolicy:
             defender_embeddings = node_embeddings[:, :num_defenders]
             intruder_embeddings = node_embeddings[:, num_defenders : num_defenders + num_intruders]
             point_start = num_defenders + num_intruders + 1
-            point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
-            weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_features)
+            if self.use_interception_point_nodes:
+                point_embeddings = node_embeddings[:, point_start : point_start + num_intruders]
+            else:
+                point_embeddings = torch.zeros_like(intruder_embeddings)
+            if self.use_assignment_gate:
+                weights, context = self.assignment_gate(defender_embeddings, intruder_embeddings, point_embeddings, pair_features)
+            else:
+                weights = torch.zeros(1, num_defenders, num_intruders)
+                context = torch.zeros_like(defender_embeddings)
             if not self.use_graph:
                 defender_embeddings = torch.zeros_like(defender_embeddings)
                 context = torch.zeros_like(context)

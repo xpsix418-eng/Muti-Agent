@@ -1,0 +1,22 @@
+scenario: Scenario5v5
+algorithm: IPG-MAPPO w/o ITA
+extends: configs/final_5v5_ipg_mappo.yaml
+method:
+  use_dense_reward: true
+  use_predictive_reward: true
+  use_soft_assignment: false
+  use_graph_encoder: true
+  graph_type: ipg
+  use_interception_point_nodes: true
+  use_ita_edge_feature: false
+  use_assignment_gate: false
+  use_assignment_auxiliary_loss: false
+ipga:
+  graph_type: ipg
+  use_graph: true
+  use_interception_point_nodes: true
+  use_ita_features: false
+  use_assignment_gate: false
+  use_assignment_loss: false
+logging:
+  log_dir: experiments/results/final_5v5/ipg_no_ita

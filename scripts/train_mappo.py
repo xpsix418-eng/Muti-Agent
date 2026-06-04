@@ -8,7 +8,7 @@ import torch
 
 import _bootstrap  # noqa: F401
 from algorithms.mappo.trainer import MAPPOConfig, MAPPOTrainer
-from envs.config import load_env_config, load_yaml, resolve_env_config_path
+from envs.config import config_from_mapping, load_env_config, load_yaml, resolve_env_config_path
 from envs.counter_uav_env import CounterUAVEnv
 from envs.scenarios import apply_scenario_to_config
 
@@ -21,8 +21,8 @@ def main() -> None:
     parser.add_argument("--checkpoint", default=None)
     args = parser.parse_args()
 
-    raw_config = load_yaml(args.config)
-    env_config = load_env_config(resolve_env_config_path(args.config))
+    raw_config = load_extended_yaml(args.config)
+    env_config = config_from_mapping(raw_config["env"]) if "env" in raw_config else load_env_config(resolve_env_config_path(args.config))
     if "curriculum" in raw_config:
         train_curriculum(raw_config, env_config, args.total_steps, args.checkpoint)
         return
@@ -97,6 +97,7 @@ def build_trainer_config(raw_config: dict, scenario: str, total_steps_override: 
         gae_lambda=float(training.get("gae_lambda", 0.95)),
         clip_ratio=float(training.get("clip_ratio", 0.2)),
         entropy_coef=float(training.get("entropy_coef", 0.01)),
+        entropy_coef_end=float(training["entropy_coef_end"]) if "entropy_coef_end" in training else None,
         value_coef=float(training.get("value_coef", 0.5)),
         learning_rate=learning_rate,
         min_learning_rate=min_learning_rate,
@@ -111,6 +112,31 @@ def build_trainer_config(raw_config: dict, scenario: str, total_steps_override: 
         log_dir=scenario_log_dir,
         checkpoint_dir=str(Path(scenario_log_dir) / "checkpoints"),
     )
+
+
+def load_extended_yaml(path: str | Path) -> dict:
+    path = Path(path)
+    data = load_yaml(path)
+    parent = data.get("extends")
+    if not parent:
+        return data
+    parent_path = Path(parent)
+    if not parent_path.is_absolute():
+        parent_path = path.parent.parent / parent_path if path.parent.name == "configs" else path.parent / parent_path
+        if not parent_path.exists():
+            parent_path = Path.cwd() / parent
+    merged = load_extended_yaml(parent_path)
+    return deep_merge(merged, {key: value for key, value in data.items() if key != "extends"})
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 from statistics import mean, stdev
 from typing import Any
@@ -40,7 +41,7 @@ def collect_rows(results_dir: Path) -> list[dict[str, Any]]:
                 with path.open("r", encoding="utf-8") as file:
                     metrics = json.load(file)
                 for metric, value in metrics.items():
-                    if isinstance(value, (int, float)):
+                    if isinstance(value, (int, float)) and math.isfinite(float(value)):
                         rows.append(
                             {
                                 "method": method_dir.name,
